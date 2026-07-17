@@ -1,0 +1,22 @@
+# AXIOM Nabla — Node Configuration
+#
+# Edit these values, then run:
+#   ./bin/nabla-ceremony --config node.toml
+#
+# The ceremony generates your node's cryptographic identity
+# (keys + NBC) in a config/ directory next to this file.
+
+# Node name — any UTF-8 string up to 64 bytes.
+# Choose something meaningful: location, operator, etc.
+name = "nabla-node"
+
+# TCP port for peer-to-peer communication.
+port = 6225
+
+# Dashboard — operator web UI
+# Must not collide with the P2P port above.
+dashboard_port = 6226
+
+# Set to true to allow dashboard access from other machines.
+# WARNING: no authentication — only enable on trusted networks.
+dashboard_remote = true

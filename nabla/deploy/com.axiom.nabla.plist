@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.axiom.nabla</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>%NABLA_BIN%</string>
+        <string>--data</string>
+        <string>%DATA_DIR%</string>
+        <string>--config</string>
+        <string>%DATA_DIR%/node.toml</string>
+        <string>--port</string>
+        <string>%PORT%</string>
+        <string>--bind</string>
+        <string>0.0.0.0</string>
+        <string>--avm-elf</string>
+        <string>%AVM_ELF%</string>
+    </array>
+
+    <!-- Do not start automatically — operator starts after editing bootstrap.toml -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Restart on crash, but not on clean exit -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Matches Linux RestartSec=10 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>%LOG_DIR%/nabla.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>%LOG_DIR%/nabla.err.log</string>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>AXIOM_ZKVM_ELF</key>
+        <string>%DATA_DIR%/zkvm/axiom-dmap-core.elf</string>
+        <key>AXIOM_ZKVM_IMAGE_ID</key>
+        <string>%DATA_DIR%/zkvm/image-id.hex</string>
+    </dict>
+
+    <!-- File descriptor limit -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

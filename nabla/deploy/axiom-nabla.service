@@ -1,0 +1,34 @@
+[Unit]
+Description=AXIOM Nabla Node
+After=network-online.target ntp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+Group=%USER%
+
+ExecStart=%NABLA_BIN% \
+    --data %DATA_DIR% \
+    --config %DATA_DIR%/node.toml \
+    --port 6225 \
+    --bind 0.0.0.0 \
+    --avm-elf %AVM_ELF%
+
+Restart=on-failure
+RestartSec=10
+
+# Resource limits for Pi
+LimitNOFILE=65536
+MemoryMax=1500M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=axiom-nabla
+Environment="RUST_LOG=info"
+Environment="AXIOM_ZKVM_ELF=%DATA_DIR%/zkvm/axiom-dmap-core.elf"
+Environment="AXIOM_ZKVM_IMAGE_ID=%DATA_DIR%/zkvm/image-id.hex"
+
+[Install]
+WantedBy=multi-user.target

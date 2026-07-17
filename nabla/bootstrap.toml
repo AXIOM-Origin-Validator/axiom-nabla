@@ -1,0 +1,66 @@
+# ══════════════════════════════════════════════════════════════════
+# AXIOM Nabla — Bootstrap Peers (RUNTIME CONFIG)
+#
+# This file is NOT compiled into the binary.
+# It is read at startup. Edit it any time, then restart your node.
+#
+# The binary (nabla-node) loads this file via:
+#   nabla-node --bootstrap /path/to/bootstrap.toml
+#   or automatically from: <data_dir>/bootstrap.toml
+#
+# Format: TOML array of [[peer]] entries
+#   [[peer]]
+#   address = "10.0.0.1:6225"
+#
+#   [[peer]]
+#   address = "[2001:db8::1]:6225"       # IPv6
+#
+#   [[peer]]
+#   address = "node1.axiom.network:6225" # Domain name
+#
+#   - Lines starting with # are comments
+#   - Max 128 entries (BOOTSTRAP_PEERS_MAX)
+#
+# These are network ENTRY POINTS, not privileged nodes.
+# After joining, your node discovers peers via gossip.
+# If all entries here are dead, your node still works if it
+# has any live mesh peer from a previous session.
+# ══════════════════════════════════════════════════════════════════
+
+# ── Genesis Nabla Nodes (10 seeds) ──
+# Ports 6225-6234. Replace 127.0.0.1 with real operator addresses
+# for production deployment.
+
+[[peer]]
+address = "127.0.0.1:6225"
+
+[[peer]]
+address = "127.0.0.1:6226"
+
+[[peer]]
+address = "127.0.0.1:6227"
+
+[[peer]]
+address = "127.0.0.1:6228"
+
+[[peer]]
+address = "127.0.0.1:6229"
+
+[[peer]]
+address = "127.0.0.1:6230"
+
+[[peer]]
+address = "127.0.0.1:6231"
+
+[[peer]]
+address = "127.0.0.1:6232"
+
+[[peer]]
+address = "127.0.0.1:6233"
+
+[[peer]]
+address = "127.0.0.1:6234"
+
+# ── Add more peers below ──
+# Operators: paste your node's address here.
+# You only need 2-3 reachable entries to bootstrap.

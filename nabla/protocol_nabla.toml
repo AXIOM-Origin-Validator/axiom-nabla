@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  AXIOM · NABLA tuning registers          →  tuning_gen::*   (Nabla host only)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Edit a value here, rebuild Nabla, and build.rs regenerates the Rust constants.
+#  Nabla-only tuning (TARDIS cadence, mesh, quarantine, OODS) — NO CoreID impact.
+#
+#  FORMAT      KEY = VALUE    # optional inline comment. Values are LITERAL u64;
+#              constants.rs casts to u8/u32/usize/i64 where needed.
+#  DEV/PROD    The uncommented line is the value IN USE (the dev/test cadence).
+#              The `# KEY = N` line beneath it records the PRODUCTION value —
+#              to go to production, swap which line is commented.
+#              (build.rs also accepts `key_dev` pairs like protocol_core.toml;
+#              this file predates that and uses the toggle style.)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# ── TARDIS rotation (tree anti-ossification) ───────────────────────────────
+#  Tuned 2026-06-01 to calculus-derived optima — full derivation (adversary
+#  exposure, R = T_child/T_parent = 2) in docs/AXIOM_DESIGN_RotationTuning.md §3.
+#  Parent fires more often than child (cheap 1-orphan move vs 3-orphan disassembly).
+
+# Parent drops its slowest child every N ticks.
+PARENT_ROTATION_INTERVAL_TICKS = 2000     # test  ~2.8h
+# PARENT_ROTATION_INTERVAL_TICKS = 17280  # prod  ~24h
+PARENT_ROTATION_JITTER_TICKS   = 200      # test  per-node jitter (~10% of interval)
+# PARENT_ROTATION_JITTER_TICKS = 1440     # prod  ~2h
+
+# Child voluntarily switches parent every N ticks.
+CHILD_ROTATION_INTERVAL_TICKS  = 4000     # test  ~5.6h
+# CHILD_ROTATION_INTERVAL_TICKS = 51840   # prod  ~72h
+CHILD_ROTATION_JITTER_TICKS    = 400      # test  ~33 min
+# CHILD_ROTATION_JITTER_TICKS = 14400     # prod  ~20h
+
+# ── TARDIS recovery / stability ────────────────────────────────────────────
+WRITER_SETTLE_TICKS      = 50   # grace before writer-check accrues on a new parent
+                                #   (>= PARENT_ROTATION_INTERVAL; avoids dc=1 bounce loops)
+WRITER_GRACE_TICKS       = 100  # consecutive non-writer ticks before a child detaches
+                                #   (~8 min; bumped from 3 at KI#18 to stop tree thrash)
+REBALANCE_COOLDOWN_TICKS = 10   # cooldown between voluntary rebalance moves
+D_RESERVATION_TICKS      = 10   # hold a D slot this long after a child goes offline
+PARENTLESS_TIMEOUT_TICKS = 5    # a node with children but no parent must reconnect within this
+
+# ── Reattach (post-partition tree merge, TARDIS §2.16.5) ───────────────────
+REATTACH_STABILITY_TICKS = 20   # leaf must sit with current parent this long before reattach
+REATTACH_MAX_PER_TICK    = 3    # max reattach moves per tick, network-wide
+
+# ── Gossip mesh ────────────────────────────────────────────────────────────
+MESH_PEER_BASE             = 9    # target peer count (base)
+MESH_PEER_MAX              = 18   # peer count ceiling
+ROTATION_INTERVAL          = 30   # peer-set rotation cadence (ticks)
+OPPORTUNISTIC_INTERVAL     = 60   # opportunistic-graft cadence (ticks)
+STALE_PEER_THRESHOLD       = 60   # ticks of silence before a peer is stale
+KNOWLEDGE_REFRESH_INTERVAL = 30   # knowledge-gossip refresh cadence (ticks)
+
+# ── Tick ───────────────────────────────────────────────────────────────────
+TICK_INTERVAL_SECS      = 5   # seconds per tick — MUST match protocol_core.toml
+TICK_SLOT_PIGGYBACK_MAX = 8   # max slot updates piggybacked on one tick
+
+# ── Genesis pool sizes (in AXC) ────────────────────────────────────────────
+#  Tunable magnitudes, expressed in whole AXC for readability. constants.rs
+#  converts to atoms via axiom_denomination::axc(N) — so the atom count is always
+#  derived from ATOMS_PER_AXC, never a hand-mirrored 10^N literal.
+airdrop_pool_initial_axc      = 600_000     # airdrop pool
+dev_treasury_pool_initial_axc = 1_000_000   # dev-AXC treasury (FACT class isolation §4)
+
+# ── OODS-tardis + tick-lineage (2026-07-08) ────────────────────────────────
+#  Centralized here from hardcoded copies once duplicated across tardis.rs +
+#  nabla_node.rs (drift risk). See YPX-021 (OODS) + TARDIS §7.6 (lineage).
+OODS_EPOCH_TICKS        = 720   # ~1h @ 5s — OODS-tardis epoch-seed rotation
+LINEAGE_FRESHNESS_TICKS = 3     # |drift| bound for tick-lineage prev_sig freshness

@@ -1,0 +1,64 @@
+[package]
+name = "axiom-nabla"
+version.workspace = true
+edition = "2021"
+description = "AXIOM Nabla — citizen infrastructure for wallet state verification"
+
+[[bin]]
+name = "nabla"
+path = "src/bin/nabla.rs"
+
+[[bin]]
+name = "nabla-sim"
+path = "src/bin/nabla_sim.rs"
+
+[[bin]]
+name = "nabla-node"
+path = "src/bin/nabla_node.rs"
+
+[[bin]]
+name = "scar-proof-builder"
+path = "src/bin/scar_proof_builder.rs"
+
+[dependencies]
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["ceremony"] }
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = false, features = ["verify"] }
+# Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2c).
+axiom-errors = { workspace = true, features = ["std"] }
+blake3 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+ciborium = { workspace = true }
+serde_json = "1"
+toml = "0.8"
+ed25519-dalek = { version = "2", features = ["serde"] }
+rand = "0.8"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+socket2 = "0.5"
+fips205 = { version = "0.4", features = ["slh_dsa_sha2_128s"] }
+fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+# SIGTERM/SIGINT trap so Nabla can flush pool state + take a final
+# snapshot before the env's SIGKILL backstop fires (see Fix #4 from
+# the 2026-05-24 financial-rigor follow-up). Without this, in-flight
+# gossip stats + WAL tail-bytes that hadn't reached a checkpoint
+# could be lost on signal-driven shutdown. Pool state is already
+# atomic-written on every mutation; the handler is defense-in-depth.
+ctrlc = { version = "3", features = ["termination"] }
+
+[features]
+dev-status = []
+# Allow --dev flag in release builds (for testnet). Mainnet builds omit this.
+dev-mode = []
+# Gate pulse calibration behind Lambda benchmark (production release only)
+pulse-gate = ["axiom-dmap-vm/pulse-gate"]
+
+[dev-dependencies]
+axiom-nabla-ceremony = { path = "../nabla-ceremony" }
+tempfile = "3"
