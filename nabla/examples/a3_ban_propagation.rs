@@ -1,3 +1,12 @@
+// ⚠ RETIRED DETECTOR (2026-09-30, Fork Settlement §9o [R56], W2 — KI#235): this
+// harness drives check-3, the `previous_states`-based seq-fork ban that flooded
+// `SeqForkBan`. check-3 is DELETED and `SeqForkBan` is a dropped, counted
+// tombstone (`seqforkban_dropped`), so on a W2+ build its positive scenario does
+// NOT ban — read its output as history, not as a gate. Forks are judged only on
+// self-proving `ForkClaim` evidence (`ban::verify_fork_claim`); the in-process
+// gate is `nabla/src/fork_detection_mesh.rs` (S1–S13, fork_retire_proof_*), the
+// live lost-flood gate mode is still owed (§9o proof obligations).
+//
 // A3 measurement — SeqForkBan origination → mesh-wide propagation latency,
 // measured against the redeem maturity window. Closes the one empirical
 // assumption of the paper's safety theorem: A3, "ban propagation completes
@@ -37,6 +46,28 @@ use axiom_nabla::types::{GossipMessage, SeqProof, SeqProofSig};
 use axiom_nabla::wire_client::QueryWalletStateRequest;
 
 type B32 = [u8; 32];
+
+/// KI#241 F-2 (2026-10-01): a redeem leg CARRIES its cheque's origin and every
+/// node refuses it unless `origin.preimage.txid(origin.epoch) == cheque txid`
+/// (`nabla_wire::cheque_origin_matches`). A probe's txid can therefore no
+/// longer be an arbitrary literal: the literal is now a TAG, and the txid on
+/// the wire is the txid of this probe origin.
+fn probe_origin(tag: &[u8; 32]) -> axiom_core_logic::types::OriginRecord {
+    axiom_core_logic::types::OriginRecord {
+        preimage: axiom_core_logic::types::WitnessPreimage {
+            consumed_state_id: *tag, client_pk: [0xEE; 32], wallet_seq: 1,
+            receiver_wallet_id: "probe@axiom.internal/0123456789".to_string(), amount: 1_000, nonce: 1,
+        },
+        epoch: 7,
+        kind: axiom_core_logic::types::LegKind::Send,
+    }
+}
+
+/// The wire txid of probe TAG `tag` (see [`probe_origin`]).
+fn probe_txid(tag: &[u8; 32]) -> [u8; 32] {
+    let o = probe_origin(tag);
+    o.preimage.txid(o.epoch)
+}
 
 const POSITIVE_QUORUM: usize = 2; // the redeem-side 2-of-N gate (verify_cheque)
 const MATURITY_TICKS_MIN: u64 = 5; // §4.6 maturity floor
@@ -99,13 +130,18 @@ fn query(addr: &str, wallet: &B32) -> Option<(String, Vec<u8>)> {
     }
 }
 
-fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize) -> SeqProof {
+fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize, leg_client_pk: B32, leg_consumed: B32, leg_new_state: B32) -> SeqProof {
+    let tag = tx; // KI#241 F-2: the caller's tx is a TAG
+    let tx = &probe_txid(tag);
     let state_hash = [0x5a_u8; 32];
-    let commitment_hash = [0x7c_u8; 32];
+    let redeem = axiom_core_logic::types::RedeemPreimage { cheque_txid: *tx, receiver_pk: leg_client_pk, new_balance: 0, new_state_id: leg_new_state, consumed_state_id: leg_consumed };
+    let commitment_hash = redeem.commitment_hash();
     let (epoch, is_dev_class) = (7u64, false);
     let commitment = axiom_core_logic::compute::compute_receipt_commitment(
         tx, &state_hash, wallet_seq, &commitment_hash, epoch, is_dev_class,
         None,
+        None, // CI — P3.6 trailing arg
+        None, // sender_state — §32.3 received-from lineage (38a8cdd6)
     );
     let sigs = (0..n)
         .map(|i| {
@@ -119,7 +155,7 @@ fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize) -> SeqProof {
             }
         })
         .collect();
-    SeqProof { state_hash, commitment_hash, epoch, is_dev_class, sigs, oods_flag: None }
+    SeqProof { state_hash, commitment_hash, epoch, is_dev_class, sigs, oods_flag: None, confidence_index: None, sender_state: None, required_k: 3, preimage: axiom_nabla::types::LegPreimage::Redeem { redeem, cheque: probe_origin(tag) } /* Fork Settlement W7a: the leg is a GENUINE redeem leg bound to this probe's carrier (cheque_txid = tx, receiver = client_pk, consumed, produced) and the k sign over its recompute — W7a verifies redeem legs on the flood, so the pre-W7a unit `Redeem` ("no preimage") would now be refused at the leg check and this probe would measure THAT instead of its target */, declared: axiom_nabla::types::DeclaredState { balance: 0, wallet_seq: wallet_seq } /* W7b: the seq the k signed rides with a redeem leg */ }
 }
 
 fn seq_update(
@@ -130,9 +166,14 @@ fn seq_update(
     tick: u64,
     wallet_seq: u64,
 ) -> WireMessage {
-    let proof = mint_seq_proof(tx, wallet_seq, 3);
-    let payload = client_state_sign_payload(wid, new_state, tx, tick);
+    // Carrier: parent unknown ([0; 32]), produced `new_state`, the wallet's key.
+    let tag = tx; // KI#241 F-2: the caller's tx is a TAG; the wire txid is its probe origin's
+    let tx = &probe_txid(tag);
+    let proof = mint_seq_proof(tag, wallet_seq, 3, wallet.public_key_bytes(), [0u8; 32], *new_state);
+    let payload = client_state_sign_payload(wid, new_state, tx);
     WireMessage::Gossip(GossipMessage::StateUpdate {
+        is_genesis_claim: false,
+        old_state: [0u8; 32],
         wallet_id: *wid,
         new_state: *new_state,
         tx_hash: *tx,

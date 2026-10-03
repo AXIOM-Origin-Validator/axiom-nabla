@@ -24,37 +24,28 @@ use crate::types::TxHash;
 
 /// Default era duration in TARDIS ticks.
 /// 90 days × 86400 s/day ÷ 5 s/tick = 1,555,200 ticks.
-pub const DEFAULT_ERA_DURATION_TICKS: u64 = 90 * 86400 / 5;
+/// KI#44/KI#47: the register value is a tick COUNT; era boundaries are tick
+/// VALUES, so it is projected via `.to_secs()`. That is what makes an era a
+/// true 90 days (1_555_200 * 5 = 7_776_000) instead of the 18 days the raw
+/// count silently produced — the oversized `gap_eras` that forced a
+/// fresh-chain rebase on every boot.
+pub const DEFAULT_ERA_DURATION_TICKS: u64 =
+    crate::constants::DEFAULT_ERA_DURATION_TICKS.to_secs();
 
 /// Target false positive rate for individual era bloom files at era close.
 /// 10⁻¹² — chosen so that compounded FPR over 1000 eras (~250 years of
 /// quarterly) stays below 10⁻⁹, effectively zero. See YPX-018 §3.4.
 pub const BLOOM_ERA_FPR_TARGET: f64 = 1e-12;
 
-/// Status of a bloom era in the Bloom Age Index (YPX-018 §3.3, mirrors
-/// `axiom_core_logic::types::EraStatus`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
-pub enum EraStatus {
-    /// Currently accepting writes. Exactly one era is Active at any time.
-    #[default]
-    Active,
-    /// Closed; bloom file is immutable. Can be queried but not modified.
-    Frozen,
-    /// Console-approved phase-out scheduled. Queries return real answers
-    /// during the grace period, tagged with a phase-out warning.
-    ScheduledPhaseOut {
-        effective_tick: u64,
-        console_cert_hash: [u8; 32],
-    },
-    /// Phase-out has taken effect. Archive nodes are FREE to drop the era's
-    /// full hash records. The age-index entry remains forever for auditability.
-    PhasedOut {
-        effective_tick: u64,
-        console_cert_hash: [u8; 32],
-    },
-}
-
+/// Status of a bloom era in the Bloom Age Index (YPX-018 §3.3).
+///
+/// KI#177 (2026-10-01): this WAS a hand copy ("mirrors
+/// `axiom_core_logic::types::EraStatus`") with identical variants and field names
+/// — a MIRROR the widened `check_mirror_structs.py` name pass flagged. It is now
+/// Core's type, re-exported. The bytes did not change (nabla's extra
+/// `#[derive(Default)]` was not serde-visible); the persisted shape is pinned by
+/// `tests::era_status_persisted_cbor_shape_is_pinned`.
+pub use axiom_core_logic::types::EraStatus;
 
 /// One era in a bloom chain (YPX-018 §3.3).
 ///
@@ -170,6 +161,50 @@ pub fn compute_bloom_root(filter: &TxidBloomFilter) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// KI#177 persisted-shape PIN (Fable 2026-10-01). Nabla's `EraStatus` IS Core's
+    /// type (`pub use` above), so a Core edit — a renamed variant or field, a serde
+    /// attribute — would silently change the bytes nabla writes into the Bloom Age
+    /// Index. This pins every variant to fixed CBOR bytes (serde externally tagged:
+    /// unit variant = text, struct variant = 1-entry map of name -> field map).
+    /// Calibrated 2026-10-01 against nabla's former local enum (byte-identical), so
+    /// the re-export changed no persisted shape. If this goes red, it is a
+    /// PERSISTED-SHAPE change: write the migration first
+    /// ([[feedback_retain_rotation_needs_persisted_shape_check]]).
+    #[test]
+    fn era_status_persisted_cbor_shape_is_pinned() {
+        fn cbor(v: &EraStatus) -> String {
+            let mut out = Vec::new();
+            ciborium::into_writer(v, &mut out).expect("encode EraStatus");
+            hex::encode(out)
+        }
+        let h32 = format!("9820{}", "07".repeat(32)); // [u8;32] = CBOR array(32) of 7
+        // "Active" / "Frozen" as CBOR text(6)
+        assert_eq!(cbor(&EraStatus::Active), "66416374697665");
+        assert_eq!(cbor(&EraStatus::Frozen), "6646726f7a656e");
+        // {"ScheduledPhaseOut": {"effective_tick": 1, "console_cert_hash": [7;32]}}
+        assert_eq!(
+            cbor(&EraStatus::ScheduledPhaseOut { effective_tick: 1, console_cert_hash: [7; 32] }),
+            format!("a1715363686564756c656450686173654f7574a26e6566666563746976655f7469636b0171636f6e736f6c655f636572745f68617368{h32}")
+        );
+        // {"PhasedOut": {"effective_tick": 1, "console_cert_hash": [7;32]}}
+        assert_eq!(
+            cbor(&EraStatus::PhasedOut { effective_tick: 1, console_cert_hash: [7; 32] }),
+            format!("a1695068617365644f7574a26e6566666563746976655f7469636b0171636f6e736f6c655f636572745f68617368{h32}")
+        );
+        // Round-trip: every pinned shape decodes back to itself.
+        for v in [
+            EraStatus::Active,
+            EraStatus::Frozen,
+            EraStatus::ScheduledPhaseOut { effective_tick: 9, console_cert_hash: [1; 32] },
+            EraStatus::PhasedOut { effective_tick: 9, console_cert_hash: [1; 32] },
+        ] {
+            let mut out = Vec::new();
+            ciborium::into_writer(&v, &mut out).unwrap();
+            let back: EraStatus = ciborium::from_reader(out.as_slice()).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
     fn make_hash(n: u8) -> TxHash {
         let mut h = [0u8; 32];
         h[0] = n;
@@ -178,9 +213,31 @@ mod tests {
     }
 
     #[test]
-    fn test_default_era_duration_is_90_days() {
-        // 90 days * 86400 s/day / 5 s/tick = 1,555,200
-        assert_eq!(DEFAULT_ERA_DURATION_TICKS, 1_555_200);
+    fn test_default_era_duration_matches_register_projected() {
+        // The era duration is the register's tick COUNT projected onto the
+        // tick-VALUE scale. KI#44/#47: mixing those units silently made a
+        // "90-day" era 18 days, and the inflated gap_eras forced a fresh-chain
+        // rebase on every boot.
+        assert_eq!(
+            DEFAULT_ERA_DURATION_TICKS,
+            crate::constants::DEFAULT_ERA_DURATION_TICKS.to_secs(),
+            "era duration must be the register COUNT projected via .to_secs()"
+        );
+
+        #[cfg(not(feature = "dev-tuning"))]
+        {
+            // Production: a real 90 days (YPX/AE design doc sizing table).
+            assert_eq!(DEFAULT_ERA_DURATION_TICKS, 90 * 86_400);
+            assert_eq!(DEFAULT_ERA_DURATION_TICKS / 86_400, 90);
+        }
+
+        #[cfg(feature = "dev-tuning")]
+        {
+            // Dev is deliberately SHORT so eras actually ROTATE during a soak —
+            // otherwise KI#42 era-sync and the KI#44 grid get no live coverage.
+            assert_eq!(DEFAULT_ERA_DURATION_TICKS, 600, "dev era ~10 min");
+            assert!(DEFAULT_ERA_DURATION_TICKS < 90 * 86_400);
+        }
     }
 
     #[test]

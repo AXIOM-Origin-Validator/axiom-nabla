@@ -366,9 +366,17 @@ pub struct SimNode {
     pub bans: BanTable,
     pub pool: DailyPoolState,
     pub airdrop_pool: crate::node::AirdropPool,
+    /// Validator-join subsidy pools (AXIOM_DESIGN_ValidatorJoin.md §2).
+    /// Drain-only, same type as the airdrop pool.
+    pub bootstrap_pool: crate::node::AirdropPool,
+    pub foundation_bootstrap_pool: crate::node::AirdropPool,
     pub dev_treasury_pool: crate::node::DevTreasuryPool,
     pub deed_pool: crate::node::DeedPool,
     pub dev_deed_pool: crate::node::DevDeedPool,
+    /// Contribution emission pools (KI#191 residual): reconciled inside
+    /// `GossipEngine::process` like every pool. The lib sim never advertises
+    /// emission PoolSync, so this stays at its opening state.
+    pub emission: crate::emission::EmissionPools,
     pub tardis: TardisNode,
     pub tick: u64,
     /// Tick received via TARDIS tree cascade (vs global sim tick).
@@ -415,9 +423,14 @@ impl SimNode {
             bans: BanTable::new(),
             pool: DailyPoolState::new(),
             airdrop_pool: crate::node::AirdropPool::new(crate::constants::AIRDROP_POOL_INITIAL_ATOMS),
+            bootstrap_pool: crate::node::AirdropPool::new(crate::constants::BOOTSTRAP_POOL_INITIAL_ATOMS)
+                .with_class_constants(crate::constants::BOOTSTRAP_POOL_INITIAL_ATOMS, axiom_core_logic::types::TIER3_CLAIM_ATOMS),
+            foundation_bootstrap_pool: crate::node::AirdropPool::new(crate::constants::FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS)
+                .with_class_constants(crate::constants::FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS, axiom_core_logic::types::TIER2_CLAIM_ATOMS),
             dev_treasury_pool: crate::node::DevTreasuryPool::new(crate::constants::DEV_TREASURY_POOL_INITIAL_ATOMS),
             deed_pool: crate::node::DeedPool::new(),
             dev_deed_pool: crate::node::DevDeedPool::new(),
+            emission: crate::emission::EmissionPools::new_from_registers(0),
             tardis: TardisNode::new(node_id),
             tick: 0,
             tardis_tick: 0,
@@ -455,9 +468,14 @@ impl SimNode {
             bans: BanTable::new(),
             pool: DailyPoolState::new(),
             airdrop_pool: crate::node::AirdropPool::new(crate::constants::AIRDROP_POOL_INITIAL_ATOMS),
+            bootstrap_pool: crate::node::AirdropPool::new(crate::constants::BOOTSTRAP_POOL_INITIAL_ATOMS)
+                .with_class_constants(crate::constants::BOOTSTRAP_POOL_INITIAL_ATOMS, axiom_core_logic::types::TIER3_CLAIM_ATOMS),
+            foundation_bootstrap_pool: crate::node::AirdropPool::new(crate::constants::FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS)
+                .with_class_constants(crate::constants::FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS, axiom_core_logic::types::TIER2_CLAIM_ATOMS),
             dev_treasury_pool: crate::node::DevTreasuryPool::new(crate::constants::DEV_TREASURY_POOL_INITIAL_ATOMS),
             deed_pool: crate::node::DeedPool::new(),
             dev_deed_pool: crate::node::DevDeedPool::new(),
+            emission: crate::emission::EmissionPools::new_from_registers(0),
             tardis: TardisNode::new(node_id),
             tick: 0,
             tardis_tick: 0,
@@ -484,7 +502,11 @@ impl SimNode {
         self.mesh.observe_node(*sender, self.tick);
 
         let n_validators = self.mesh.estimated_network_size();
-        let action = self.gossip.process(msg, &mut self.smt, &mut self.bans, &mut self.pool, &mut self.airdrop_pool, &mut self.dev_treasury_pool, &mut self.deed_pool, &mut self.dev_deed_pool, &self.signer, self.tick, n_validators);
+        // The simulator does not exercise FOB Bounded-Fee pools — pass empty
+        // maps (the BoundedFee arm no-ops without pools/credits).
+        let mut sim_fob_pools = std::collections::HashMap::new();
+        let sim_fob_credits = std::collections::HashMap::new();
+        let action = self.gossip.process(msg, &mut self.smt, &mut self.bans, &mut self.pool, &mut self.airdrop_pool, &mut self.dev_treasury_pool, &mut self.bootstrap_pool, &mut self.foundation_bootstrap_pool, &mut self.deed_pool, &mut self.dev_deed_pool, &mut self.emission, &mut sim_fob_pools, &sim_fob_credits, self.tick, self.tick /* A19: the sim has no wall clock — its tick stands in for now_secs (sim-only unit substitution) */, n_validators, &|_| false /* KI#224: the sim carries no SeqProofs and has no witness directory */);
         match action {
             GossipAction::Forward(fwd_msg) => {
                 self.messages_received += 1;
@@ -497,17 +519,7 @@ impl SimNode {
                 true
             }
             GossipAction::Duplicate => false,
-            GossipAction::BanDetected { forward, ban_alert } => {
-                self.messages_received += 1;
-                self.last_gossip_tick = self.tick;
-
-                let targets = self.mesh.forward_targets(sender);
-                for target in &targets {
-                    self.outbox.push_back((*target, forward.clone()));
-                    self.outbox.push_back((*target, ban_alert.clone()));
-                }
-                true
-            }
+            // `BanDetected` deleted 2026-09-30 (§9o [R56], W2): check-3 retired.
             GossipAction::PoolViolationDetected { .. } => {
                 // Sim doesn't model the full Layer 4 quarantine
                 // emission path — production binary handles it. For
@@ -1296,12 +1308,13 @@ impl SimNetwork {
                     if !self.nodes[i].alive { continue; }
                     if self.nodes[i].tardis.has_d_open() {
                         let open = 2 - self.nodes[i].tardis.downstream_count() as u8;
+                        // §5.6a-bis: identity + slot count only. The simulator
+                        // used to synthesise a 10.0.x.y address here, which made
+                        // the sim structurally unable to reproduce the very bug
+                        // this change fixes — every node had a usable address for
+                        // every other node without anyone ever observing one.
                         let hint = TopologyHint::SlotAvailable {
                             node_id: self.nodes[i].node_id,
-                            address: NablaAddress::V4 {
-                                ip: [10, 0, (i / 256) as u8, (i % 256) as u8],
-                                port: 6225,
-                            },
                             open_slots: open,
                         };
                         let peer_ids: Vec<NodeId> = self.nodes[i].mesh.peer_ids();
@@ -2155,22 +2168,24 @@ impl SimNetwork {
                 };
 
                 // Collect entries from source that destination is missing
-                let src_entries: Vec<(WalletId, StateId, TxHash, u64)> = self.nodes[src_idx].smt.entries()
+                let src_entries: Vec<(WalletId, StateId, TxHash, u64, [u8; 32], Vec<u8>)> = self.nodes[src_idx].smt.entries()
                     .iter()
                     .filter(|(wid, _)| self.nodes[dst_idx].smt.get(wid).is_none())
-                    .map(|(_, entry)| (entry.wallet_id, entry.current_state, entry.tx_hash, entry.tick))
+                    .map(|(_, entry)| (entry.wallet_id, entry.current_state, entry.tx_hash, entry.tick, entry.client_pk, entry.client_sig.clone()))
                     .collect();
 
                 let sender_nid = self.nodes[src_idx].node_id;
-                for (wallet_id, new_state, tx_hash, tick) in src_entries {
+                for (wallet_id, new_state, tx_hash, tick, client_pk, client_sig) in src_entries {
                     let msg = GossipMessage::StateUpdate {
-                        wallet_id, new_state, tx_hash, tick,
+                        wallet_id, new_state, old_state: [0u8; 32], tx_hash, tick,
             is_genesis_claim: false,
                         // sim exercises mesh replication, not seq anti-rollback —
                         // seq 0 + no proof so the WI3 hole-1 gate falls through to
                         // tick ordering (the sim's pre-WI3 behaviour).
                         wallet_seq: 0,
-                        client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                        // KI#46 zero-pk flip: replicate the STORED entry's
+                        // authorship (mirrors the real StatePull/RangeSync replay).
+                        client_pk, client_sig,
                         amount: 0, fee_breakdown: Vec::new(),
                         seq_proof: None,
                     };
@@ -2603,18 +2618,31 @@ impl SimNetwork {
         if node_idx >= self.nodes.len() || !self.nodes[node_idx].alive {
             return false;
         }
-        let mut wallet_id = [0u8; 32];
-        wallet_id[..8].copy_from_slice(&self.tick.to_le_bytes());
-        wallet_id[8..16].copy_from_slice(&(node_idx as u64).to_le_bytes());
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&self.tick.to_le_bytes());
+        seed[8..16].copy_from_slice(&(node_idx as u64).to_le_bytes());
 
-        let state = *blake3::hash(&wallet_id).as_bytes();
+        // KI#46 zero-pk flip: sim traffic must be wallet-authored (zero-pk is
+        // rejected mesh-wide now). Deterministic key from a per-(tick, node)
+        // seed keeps the sim reproducible; the sig covers the YPX-009 payload.
+        // KI#226: the wallet id IS that key's own row (its pk, k=3) — a flood
+        // naming any other id is refused.
+        let (wallet_id, state, client_pk, client_sig) = {
+            use ed25519_dalek::{Signer as _, SigningKey};
+            let sk = SigningKey::from_bytes(blake3::hash(&seed).as_bytes());
+            let wallet_id = sk.verifying_key().to_bytes();
+            let state = *blake3::hash(&wallet_id).as_bytes();
+            let payload =
+                crate::gossip::client_state_sign_payload(&wallet_id, &state, &state);
+            (wallet_id, state, wallet_id, sk.sign(&payload).to_bytes().to_vec())
+        };
         let msg = GossipMessage::StateUpdate {
-            wallet_id, new_state: state, tx_hash: state, tick: self.tick_time_secs(),
+            wallet_id, new_state: state, old_state: [0u8; 32], tx_hash: state, tick: self.tick_time_secs(),
             is_genesis_claim: false,
             // sim exercises mesh replication, not seq anti-rollback — seq 0 + no
             // proof so the WI3 hole-1 gate falls through to tick ordering.
             wallet_seq: 0,
-            client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+            client_pk, client_sig,
             amount: 0, fee_breakdown: Vec::new(),
             seq_proof: None,
         };
@@ -2622,7 +2650,9 @@ impl SimNetwork {
         let node = &mut self.nodes[node_idx];
         let sender_nid = node.node_id;
         let n_validators = node.mesh.estimated_network_size();
-        let action = node.gossip.process(&msg, &mut node.smt, &mut node.bans, &mut node.pool, &mut node.airdrop_pool, &mut node.dev_treasury_pool, &mut node.deed_pool, &mut node.dev_deed_pool, &node.signer, node.tick, n_validators);
+        let mut sim_fob_pools = std::collections::HashMap::new();
+        let sim_fob_credits = std::collections::HashMap::new();
+        let action = node.gossip.process(&msg, &mut node.smt, &mut node.bans, &mut node.pool, &mut node.airdrop_pool, &mut node.dev_treasury_pool, &mut node.bootstrap_pool, &mut node.foundation_bootstrap_pool, &mut node.deed_pool, &mut node.dev_deed_pool, &mut node.emission, &mut sim_fob_pools, &sim_fob_credits, node.tick, node.tick /* A19: the sim has no wall clock — its tick stands in for now_secs (sim-only unit substitution) */, n_validators, &|_| false /* KI#224: the sim carries no SeqProofs and has no witness directory */);
         if let GossipAction::Forward(fwd) = action {
             let targets = node.mesh.forward_targets(&sender_nid);
             for target in targets {
@@ -3072,11 +3102,17 @@ impl SimNetwork {
 
         // Reader first-contact ratio (GAP-14 §1.2.1):
         // % of alive non-orphan nodes that are READERs (would redirect transactions).
-        // A READER is a node that needs to redirect to a writer (find_nearest_writer returns Some).
+        // A READER is a node that redirects transactions to a writer.
         // In a healthy binary tree, ~50% of nodes are readers (leaves).
+        //
+        // KI#69: was `find_nearest_writer().is_some()`. Orphans are excluded by
+        // the `!needs_parent()` filter, so this metric did not carry the routing
+        // bug — but it read the same conflated Option. Now it names the state.
         let tardis_readers = self.nodes.iter()
             .filter(|n| {
-                n.alive && !n.tardis.needs_parent() && n.tardis.find_nearest_writer().is_some()
+                n.alive && !n.tardis.needs_parent()
+                    && matches!(n.tardis.writer_routing(),
+                                crate::tardis::WriterRouting::RedirectTo(_))
             })
             .count();
         let tardis_reader_pct = if alive_count > 0 {
@@ -3249,6 +3285,38 @@ pub struct NetworkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KI#46 zero-pk flip: gossip fixtures must be wallet-authored.
+    /// Deterministic key from the wallet id (blake3) — same scheme as the
+    /// sim's own traffic generator, so injected and re-synced copies of the
+    /// same logical entry carry the same authorship.
+    fn sim_author(
+        wallet_id: &[u8; 32],
+        state: &[u8; 32],
+        tx: &[u8; 32],
+    ) -> ([u8; 32], Vec<u8>) {
+        use ed25519_dalek::Signer as _;
+        let sk = SIM_KEYS.with(|k| k.borrow().get(wallet_id).cloned())
+            .expect("sim_author: wallet id not minted by sim_wid (KI#226: the id must be the key's own pk)");
+        let payload = crate::gossip::client_state_sign_payload(wallet_id, state, tx);
+        (sk.verifying_key().to_bytes(), sk.sign(&payload).to_bytes().to_vec())
+    }
+
+    thread_local! {
+        /// pk → key for the fixture wallets `sim_wid` minted on this test thread.
+        static SIM_KEYS: std::cell::RefCell<std::collections::HashMap<[u8; 32], ed25519_dalek::SigningKey>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// KI#226 — a fixture wallet id MUST be its signing key's own row (the pk,
+    /// k=3). Mint the key deterministically from `seed` (blake3, as before)
+    /// and return its pk as the wallet id; `sim_author` signs with it.
+    fn sim_wid(seed: [u8; 32]) -> [u8; 32] {
+        let sk = ed25519_dalek::SigningKey::from_bytes(blake3::hash(&seed).as_bytes());
+        let pk = sk.verifying_key().to_bytes();
+        SIM_KEYS.with(|k| k.borrow_mut().insert(pk, sk));
+        pk
+    }
 
     #[test]
     fn genesis_nodes_sparse_mesh() {
@@ -3995,18 +4063,42 @@ mod tests {
         net.kill_node(victim);
         for _ in 0..3 { net.step(); }
 
-        // Revive it
+        // Revive it and step until it has re-attached, rather than assuming a
+        // fixed budget suffices.
+        //
+        // FLAKE FIX (2026-07-28): this previously stepped exactly 3 times and then
+        // asserted. Re-attachment timing is not deterministic — it depends on where
+        // the parent-rotation cursor happens to sit when the node comes back, and
+        // even once attached the node only learns the CURRENT tick on its parent's
+        // next downward broadcast. Three steps is marginal for that, so the test
+        // failed at roughly 5-8%. A flaky test is worse than a slow one: it makes
+        // every future suite run ambiguous (this one cost six test batches to
+        // disambiguate from a real regression during the KI#42 work).
+        //
+        // Bounded, not unbounded: a genuine regression still fails, it just gets a
+        // fair chance to converge first.
         net.revive_node(victim);
-        for _ in 0..3 { net.step(); }
+        const MAX_REATTACH_STEPS: usize = 60;
+        for _ in 0..MAX_REATTACH_STEPS {
+            net.step();
+            let state = net.export_state();
+            let n = &state.nodes[victim];
+            if n.alive && n.has_upstream && n.tardis_tick == state.tick_time {
+                break;
+            }
+        }
 
-        // Should be back in the tree with a valid upstream
+        // Should be back in the tree with a valid upstream. Asserted individually
+        // so a failure names which property is missing, not just "did not converge".
         let state = net.export_state();
         let revived = &state.nodes[victim];
         assert!(revived.alive, "node should be alive");
         assert!(revived.has_upstream,
-            "revived node {} should have re-attached to tree", victim);
+            "revived node {} should have re-attached to tree within {} steps",
+            victim, MAX_REATTACH_STEPS);
         assert_eq!(revived.tardis_tick, state.tick_time,
-            "revived node should receive current tick");
+            "revived node should receive current tick within {} steps",
+            MAX_REATTACH_STEPS);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -4038,9 +4130,10 @@ mod tests {
             .collect();
 
         for i in 0..num_wallets {
-            let mut wid = [0u8; 32];
-            wid[0] = i as u8;
-            wid[1] = 0xCA; // marker
+            let mut seed = [0u8; 32];
+            seed[0] = i as u8;
+            seed[1] = 0xCA; // marker
+            let wid = sim_wid(seed);
             let state = *blake3::hash(&wid).as_bytes();
             let tx = *blake3::hash(&state).as_bytes();
             let tick = (i as u64 + 1) * 5;
@@ -4057,9 +4150,13 @@ mod tests {
         for dir in &dirs {
             let mut node = NablaNode::open(dir, Box::new(crate::crypto::NoopSigner)).unwrap();
 
-            // First half: pre-snapshot entries
+            // First half: pre-snapshot entries. Authored (sim_author) so the
+            // re-synced copies hash to the SAME leaf — the convergence assert
+            // compares root hashes.
             for (wid, state, tx, tick) in &wallet_data[..split] {
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let entry = NablaEntry {
+                                received_from: None,
                                 wallet_seq: 0,
                     wallet_id: *wid,
                     current_state: *state,
@@ -4067,8 +4164,8 @@ mod tests {
                     tick: *tick,
                     group_members: None,
                     status: WalletStatus::Normal,
-                    client_pk: [0u8; 32],
-                    client_sig: vec![0u8; 64],
+                    client_pk,
+                    client_sig,
                 };
                 node.inject_test_entry(&entry);
             }
@@ -4079,7 +4176,9 @@ mod tests {
 
             // Second half: post-snapshot entries (WAL-only, not in snapshot)
             for (wid, state, tx, tick) in &wallet_data[split..] {
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let entry = NablaEntry {
+                                received_from: None,
                                 wallet_seq: 0,
                     wallet_id: *wid,
                     current_state: *state,
@@ -4087,8 +4186,8 @@ mod tests {
                     tick: *tick,
                     group_members: None,
                     status: WalletStatus::Normal,
-                    client_pk: [0u8; 32],
-                    client_sig: vec![0u8; 64],
+                    client_pk,
+                    client_sig,
                 };
                 node.inject_test_entry(&entry);
             }
@@ -4152,7 +4251,7 @@ mod tests {
         // ── Phase 4: WAL audit should detect corruption ──
         // Victim nodes' WAL checksums won't match disk after corruption.
         // (audit_recent/audit_deep operate on in-memory checksums vs disk)
-        // After re-open, load_checksums recovers what's intact.
+        // After re-open, rebuild_checksums_from_file recovers what's intact.
         // The key test: entries past the corruption point are GONE.
         let missing_1: Vec<_> = wallet_data.iter()
             .filter(|(wid, ..)| node_1.smt().get(wid).is_none())
@@ -4170,7 +4269,9 @@ mod tests {
         // Simulate StatePull: healthy node serves entries, victims apply via gossip.
         // This is the real recovery path: RangeSync/StatePull → handle_gossip.
         for (wid, state, tx, tick) in &missing_1 {
+            let (client_pk, client_sig) = sim_author(wid, state, tx);
             let gossip_msg = GossipMessage::StateUpdate {
+                                 old_state: [0u8; 32],
                                  wallet_seq: 0,
                 seq_proof: None,
                 wallet_id: *wid,
@@ -4178,18 +4279,20 @@ mod tests {
                 tx_hash: *tx,
                 tick: *tick,
             is_genesis_claim: false,
-                client_pk: [0u8; 32],
-                client_sig: vec![0u8; 64],
+                client_pk,
+                client_sig,
                 amount: 0,
                 fee_breakdown: Vec::new(),
             };
-            let action = node_1.handle_gossip(&gossip_msg);
+            let action = node_1.handle_gossip(&gossip_msg, crate::types::test_legs::NOW_SECS);
             assert!(matches!(action, GossipAction::Forward(_)),
                 "victim 1: re-synced {:02x} should be accepted", wid[0]);
         }
 
         for (wid, state, tx, tick) in &missing_2 {
+            let (client_pk, client_sig) = sim_author(wid, state, tx);
             let gossip_msg = GossipMessage::StateUpdate {
+                                 old_state: [0u8; 32],
                                  wallet_seq: 0,
                 seq_proof: None,
                 wallet_id: *wid,
@@ -4197,12 +4300,12 @@ mod tests {
                 tx_hash: *tx,
                 tick: *tick,
             is_genesis_claim: false,
-                client_pk: [0u8; 32],
-                client_sig: vec![0u8; 64],
+                client_pk,
+                client_sig,
                 amount: 0,
                 fee_breakdown: Vec::new(),
             };
-            let action = node_2.handle_gossip(&gossip_msg);
+            let action = node_2.handle_gossip(&gossip_msg, crate::types::test_legs::NOW_SECS);
             assert!(matches!(action, GossipAction::Forward(_)),
                 "victim 2: re-synced {:02x} should be accepted", wid[0]);
         }
@@ -4331,9 +4434,10 @@ mod tests {
         // 10 entries → snapshot
         let mut initial_entries: Vec<(WalletId, StateId, TxHash, u64)> = Vec::new();
         for i in 0..10u8 {
-            let mut wid = [0u8; 32];
-            wid[0] = i;
-            wid[31] = 0xA0; // "initial batch" marker
+            let mut seed = [0u8; 32];
+            seed[0] = i;
+            seed[31] = 0xA0; // "initial batch" marker
+            let wid = sim_wid(seed);
             let state = *blake3::hash(&wid).as_bytes();
             let tx = *blake3::hash(&state).as_bytes();
             initial_entries.push((wid, state, tx, (i as u64 + 1) * 5));
@@ -4342,9 +4446,10 @@ mod tests {
         // ── T1: Post-snapshot entries (WAL-only) ──
         let mut post_snap_entries: Vec<(WalletId, StateId, TxHash, u64)> = Vec::new();
         for i in 10..20u8 {
-            let mut wid = [0u8; 32];
-            wid[0] = i;
-            wid[31] = 0xB0; // "post-snapshot" marker
+            let mut seed = [0u8; 32];
+            seed[0] = i;
+            seed[31] = 0xB0; // "post-snapshot" marker
+            let wid = sim_wid(seed);
             let state = *blake3::hash(&wid).as_bytes();
             let tx = *blake3::hash(&state).as_bytes();
             post_snap_entries.push((wid, state, tx, (i as u64 + 1) * 5));
@@ -4353,9 +4458,10 @@ mod tests {
         // ── T2-T3: Entries written AFTER corruption (node still "live") ──
         let mut post_corrupt_entries: Vec<(WalletId, StateId, TxHash, u64)> = Vec::new();
         for i in 20..30u8 {
-            let mut wid = [0u8; 32];
-            wid[0] = i;
-            wid[31] = 0xC0; // "post-corruption live" marker
+            let mut seed = [0u8; 32];
+            seed[0] = i;
+            seed[31] = 0xC0; // "post-corruption live" marker
+            let wid = sim_wid(seed);
             let state = *blake3::hash(&wid).as_bytes();
             let tx = *blake3::hash(&state).as_bytes();
             post_corrupt_entries.push((wid, state, tx, (i as u64 + 1) * 5));
@@ -4364,9 +4470,10 @@ mod tests {
         // ── T7: Brand-new entries that arrive AFTER restart ──
         let mut fresh_entries: Vec<(WalletId, StateId, TxHash, u64)> = Vec::new();
         for i in 30..40u8 {
-            let mut wid = [0u8; 32];
-            wid[0] = i;
-            wid[31] = 0xD0; // "fresh post-restart" marker
+            let mut seed = [0u8; 32];
+            seed[0] = i;
+            seed[31] = 0xD0; // "fresh post-restart" marker
+            let wid = sim_wid(seed);
             let state = *blake3::hash(&wid).as_bytes();
             let tx = *blake3::hash(&state).as_bytes();
             fresh_entries.push((wid, state, tx, (i as u64 + 1) * 5));
@@ -4384,11 +4491,13 @@ mod tests {
 
             // T0: initial entries → snapshot
             for (wid, state, tx, tick) in &initial_entries {
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let entry = NablaEntry {
+                                received_from: None,
                                 wallet_seq: 0,
                     wallet_id: *wid, current_state: *state, tx_hash: *tx, tick: *tick,
                     group_members: None, status: WalletStatus::Normal,
-                    client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                    client_pk, client_sig,
                 };
                 node.inject_test_entry(&entry);
             }
@@ -4397,11 +4506,13 @@ mod tests {
 
             // T1: post-snapshot entries (WAL-only)
             for (wid, state, tx, tick) in &post_snap_entries {
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let entry = NablaEntry {
+                                received_from: None,
                                 wallet_seq: 0,
                     wallet_id: *wid, current_state: *state, tx_hash: *tx, tick: *tick,
                     group_members: None, status: WalletStatus::Normal,
-                    client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                    client_pk, client_sig,
                 };
                 node.inject_test_entry(&entry);
             }
@@ -4412,11 +4523,13 @@ mod tests {
         // Build healthy node with ALL entries (no closing/reopening — stays consistent)
         let mut healthy = NablaNode::open(&healthy_dir, Box::new(crate::crypto::NoopSigner)).unwrap();
         for (wid, state, tx, tick) in all_old_entries.iter().chain(fresh_entries.iter()) {
+            let (client_pk, client_sig) = sim_author(wid, state, tx);
             let entry = NablaEntry {
+                            received_from: None,
                             wallet_seq: 0,
                 wallet_id: *wid, current_state: *state, tx_hash: *tx, tick: *tick,
                 group_members: None, status: WalletStatus::Normal,
-                client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                client_pk, client_sig,
             };
             healthy.inject_test_entry(&entry);
         }
@@ -4449,11 +4562,13 @@ mod tests {
 
             // T3 continued: write post-corruption entries (node is "live")
             for (wid, state, tx, tick) in &post_corrupt_entries {
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let entry = NablaEntry {
+                                received_from: None,
                                 wallet_seq: 0,
                     wallet_id: *wid, current_state: *state, tx_hash: *tx, tick: *tick,
                     group_members: None, status: WalletStatus::Normal,
-                    client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                    client_pk, client_sig,
                 };
                 victim.inject_test_entry(&entry);
             }
@@ -4505,15 +4620,17 @@ mod tests {
             // Fresh entry arrives (new registration, never seen before)
             if round < fresh_entries.len() {
                 let (wid, state, tx, tick) = &fresh_entries[round];
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let gossip_msg = GossipMessage::StateUpdate {
+                                     old_state: [0u8; 32],
                                      wallet_seq: 0,
                     seq_proof: None,
                     wallet_id: *wid, new_state: *state, tx_hash: *tx, tick: *tick,
             is_genesis_claim: false,
-                    client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                    client_pk, client_sig,
                     amount: 0, fee_breakdown: Vec::new(),
                 };
-                let action = victim.handle_gossip(&gossip_msg);
+                let action = victim.handle_gossip(&gossip_msg, crate::types::test_legs::NOW_SECS);
                 assert!(matches!(action, GossipAction::Forward(_)),
                     "fresh entry {:02x} must be accepted during recovery", wid[0]);
             }
@@ -4521,15 +4638,17 @@ mod tests {
             // Recovered old entry arrives from peer (StatePull gap-fill)
             if round < missing_old.len() {
                 let (wid, state, tx, tick) = &missing_old[round];
+                let (client_pk, client_sig) = sim_author(wid, state, tx);
                 let gossip_msg = GossipMessage::StateUpdate {
+                                     old_state: [0u8; 32],
                                      wallet_seq: 0,
                     seq_proof: None,
                     wallet_id: *wid, new_state: *state, tx_hash: *tx, tick: *tick,
             is_genesis_claim: false,
-                    client_pk: [0u8; 32], client_sig: vec![0u8; 64],
+                    client_pk, client_sig,
                     amount: 0, fee_breakdown: Vec::new(),
                 };
-                let action = victim.handle_gossip(&gossip_msg);
+                let action = victim.handle_gossip(&gossip_msg, crate::types::test_legs::NOW_SECS);
                 assert!(matches!(action, GossipAction::Forward(_)),
                     "recovered entry {:02x} must be accepted during concurrent writes", wid[0]);
             }

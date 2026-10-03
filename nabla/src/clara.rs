@@ -181,6 +181,13 @@ pub enum ClaraRegistrationError {
     /// the cheque's produced_state_id chain) already appears in the txid
     /// bloom chain — the wallet has already healed or already double-spent.
     ConsumedAlreadyTxidRegistered,
+    /// KI#43b: the HEALED-FROM state hit the consumed-state chain — the
+    /// KI#43 case (real double-heal/double-spend OR a bloom false
+    /// positive). Distinct from `ConsumedAlreadyTxidRegistered` (kept for
+    /// the declared-garbage lookups) so the node handler can route THIS
+    /// hit through the adjudication barrier (§12.4.4) instead of treating
+    /// it as final. Fail-closed until a verdict exists.
+    ConsumedHealedFromHit,
     /// `consumed_state_id` already appears in the garbage state bloom chain
     /// — the state was already declared garbage by a prior CLARA. Refuse.
     ConsumedAlreadyGarbage,
@@ -216,7 +223,8 @@ pub enum ClaraRegistrationError {
     /// `BLAKE3(wallet_pk || healed_balance || healed_at_seq)` and got a
     /// different value than the cheque's signed `state_hash`. Either the
     /// declared balance is wrong or the cheque was tampered with. Either way,
-    /// reject — the validator-side roll-forward must trust this binding.
+    /// reject (the balance is signed into the attestation; since KI#260 no
+    /// validator-side decision reads it).
     HealedBalanceMismatch,
 }
 
@@ -247,9 +255,13 @@ pub struct ClaraRegistrationRequest {
     /// recomputed hash does not match, the registration is rejected with
     /// `HealedBalanceMismatch`. The cheque is k=3-witnessed, so each fresh
     /// validator has cryptographically committed to this balance via its
-    /// signed `state_hash`. Validators (Lambda) use the verified balance to
-    /// refresh poisoned validators' stored balance during CLARA roll-forward.
+    /// signed `state_hash`. (No validator reads it since KI#256/KI#260 — the
+    /// roll-forward that once refreshed a poisoned balance is deleted.)
     pub healed_balance: u64,
+    /// §4.2a — carried into the recomputed §15 anchor (never cleared by a heal).
+    pub declared_emission_claimed_epoch: u64,
+    pub declared_stake_floor_until: u64, // ValidatorJoin §6b.13 — the seventh §15 field, same rule
+    pub declared_wallet_format: axiom_core_logic::types::WalletFormat, // §6b.13 — the format block
 }
 
 /// Successful registration result. The caller (HTTP handler) wraps these
@@ -284,9 +296,11 @@ fn verify_cheque_signature(cheque: &ValidatorCheque) -> bool {
         &cheque.txid,
         &cheque.state_hash,
         &cheque.produced_state_id,
+        &cheque.sender_wallet_id,
         &cheque.receiver_wallet_id,
         cheque.amount,
         cheque.epoch,
+        cheque.created_at,
         cheque.rate_bps,
         &cheque.dmap_input_hash,
         &cheque.dmap_output_hash,
@@ -315,12 +329,41 @@ fn verify_cheque_signature(cheque: &ValidatorCheque) -> bool {
 ///   - Signing the attestation with the node's Ed25519 key + populating
 ///     the NBC trust anchor fields (Phase 5e fix #5)
 ///   - Returning the on-wire `ClaraAttestation` over HTTP
+/// Two chains, split by DIRECTION (2026-07-28):
+///
+/// * `heal_chain` — CLARA's own, heal registrations only. **Written** to, for
+///   idempotency. Kept out of the redeemed set on purpose: the 2026-07-07 "ONE
+///   txid domain" decision feeds the YPX-014 service at redeem-finalize ONLY, so
+///   writing heal txids there would make `/query-txid` answer REDEEMED for merely
+///   healed txids — the exact pollution that decision removed.
+/// * `redeemed_chain` — the SMT's redeemed-TXID chain, **read** only. Consulted
+///   for the one lookup that is genuinely txid-domain: a heal txid must not
+///   collide with an already-redeemed txid.
+/// * `consumed_chain` — the SMT's consumed-STATE chain, **read** only. Every
+///   state-id lookup goes here.
+///
+/// DOMAIN DISCIPLINE (2026-07-28): each lookup queries a set of ITS OWN domain.
+/// Previously state ids were looked up in a filter of txids — 32-byte values in
+/// different domains sharing a hash space, so a hit could only ever be
+/// coincidence. YPX-018 §384 ("pre-TX1 state is now consumed in the txid bloom")
+/// was written when there was ONE combined bloom; the implementation has since
+/// split txids from consumed states, and `consumed_chain` is the set that answers
+/// "has this state been advanced past" — exactly what the error doc means by
+/// "already healed or already double-spent".
 pub fn register_clara(
     request: &ClaraRegistrationRequest,
-    txid_chain: &mut BloomChain,
+    heal_chain: &mut BloomChain,
+    redeemed_chain: &BloomChain,
+    consumed_chain: &BloomChain,
     garbage_chain: &mut GarbageStateChain,
     rate_limiter: &mut ClaraRateLimiter,
     current_tick: u64,
+    // KI#43b: a state the adjudication barrier ACQUITTED (proven bloom
+    // false positive — every recording node answered absent + clean, see
+    // §12.4.4). The healed-from freshness check is skipped for EXACTLY
+    // this state; the bloom itself is never edited. None on every path
+    // that has no verdict.
+    acquitted_state: Option<&crate::types::StateId>,
 ) -> Result<ClaraRegistrationOk, ClaraRegistrationError> {
     // (0) Phase 5f Finding 3: per-wallet rate limit. Run BEFORE any
     // signature verification or bloom-chain work — that's the whole point
@@ -331,7 +374,9 @@ pub fn register_clara(
     let bundle = &request.heal_cheque;
     let tx = &request.heal_transaction;
 
-    // (1) k=3 minimum
+    // (1) The FLOOR half of `max(k, 3)` (YP §17.3.1.4 v2.19.0, KI#150). The
+    // tier half is judged at (5f), once (5e) has authenticated the address
+    // the k is read from — never from a constant.
     if bundle.cheques.len() < 3 {
         return Err(ClaraRegistrationError::InsufficientSignatures);
     }
@@ -395,6 +440,17 @@ pub fn register_clara(
         return Err(ClaraRegistrationError::WalletPkMismatch);
     }
 
+    // (5f) The TIER half of `max(k, 3)` — YP §17.3.1.4 v2.19.0 (KI#150): the
+    // heal's k is the receiver address's tier (== sender's: (3) proved the
+    // self-send, (5e) proved the address). Never a literal.
+    let heal_k = match axiom_core_logic::wallet_id::extract_security_level(&first.receiver_wallet_id) {
+        Ok((k, _)) => (k as usize).max(3),
+        Err(_) => return Err(ClaraRegistrationError::WalletPkMismatch),
+    };
+    if bundle.cheques.len() < heal_k {
+        return Err(ClaraRegistrationError::InsufficientSignatures);
+    }
+
     // (6a) Non-empty declared garbage list
     if request.declared_garbage.is_empty() {
         return Err(ClaraRegistrationError::EmptyGarbage);
@@ -423,29 +479,48 @@ pub fn register_clara(
     // signature on the cheque commitment (which itself binds state_hash).
     // We recompute the same hash from the (wallet_pk, declared_balance,
     // wallet_seq) triple and compare. Match → trust the declared balance.
-    // Mismatch → reject; we cannot risk handing a poisoned validator a
-    // wrong balance during roll-forward.
+    // Mismatch → reject (the attestation must not sign an unanchored
+    // balance, although no validator reads it since KI#260).
     let recomputed_state_hash = axiom_core_logic::compute::compute_state_hash(
         &request.wallet_pk,
         request.healed_balance,
         tx.wallet_seq,
         0, // YPX-020: a heal is not a re-anchor — its produced state is non-hibernating
+        0, // §5.2.2c: a heal never stakes, and a staked wallet cannot reach here
+        request.declared_emission_claimed_epoch, // §4.2a: carried, never cleared by a heal
+        request.declared_stake_floor_until, // §6b.13: carried, never cleared by a heal
+        &request.declared_wallet_format,    // §6b.13
     );
     if recomputed_state_hash != first.state_hash {
         return Err(ClaraRegistrationError::HealedBalanceMismatch);
     }
 
     // (8) Idempotency — refuse if this exact heal has already been registered
-    if let ChainLookup::Hit { .. } = txid_chain.lookup(&heal_txid) {
+    // Idempotency: prior heals (CLARA's own set). Also refuse a heal txid that
+    // collides with an already-REDEEMED txid — both are txid-domain lookups.
+    if let ChainLookup::Hit { .. } = heal_chain.lookup(&heal_txid) {
+        return Err(ClaraRegistrationError::HealAlreadyRegistered);
+    }
+    if let ChainLookup::Hit { .. } = redeemed_chain.lookup(&heal_txid) {
         return Err(ClaraRegistrationError::HealAlreadyRegistered);
     }
 
     // (9) Freshness — the authoritative consumed state must not already be
     // in either chain.
     let consumed = &healed_from_state_id;
-    match txid_chain.lookup(consumed) {
+    // STATE-domain lookup → the consumed-state set. For a legitimate heal this
+    // state is the wallet's CURRENT head (the SMT advance happens only after this
+    // call succeeds), so it is not yet consumed and the check passes. It fires
+    // exactly when the wallet has already advanced past it — i.e. already healed
+    // or already double-spent, which is what the error says.
+    match consumed_chain.lookup(consumed) {
+        ChainLookup::Hit { .. } if acquitted_state == Some(consumed) => {
+            // KI#43b: barrier-acquitted bloom false positive — the exact
+            // records of every recording node prove this state was never
+            // consumed. Proceed; log at the call site.
+        }
         ChainLookup::Hit { .. } => {
-            return Err(ClaraRegistrationError::ConsumedAlreadyTxidRegistered);
+            return Err(ClaraRegistrationError::ConsumedHealedFromHit);
         }
         ChainLookup::Miss => {}
     }
@@ -459,13 +534,25 @@ pub fn register_clara(
     // Also verify none of the declared garbage states are already-txid
     // (trying to retroactively mark a confirmed transaction as abandoned).
     for gs in &request.declared_garbage {
-        if let ChainLookup::Hit { .. } = txid_chain.lookup(gs) {
+        // KI#43b (§12.4.4 implementation note): the barrier acquittal for a
+        // state applies at EVERY freshness lookup of that state in this
+        // registration. The standard partial marker declares the healed-from
+        // state itself as garbage, so the same bloom FP that check (9) just
+        // skipped re-fires HERE — the v1 build stranded the acquitted victim
+        // one line after acquitting it (found by the 2026-07-29 live gate).
+        if acquitted_state == Some(gs) {
+            continue;
+        }
+        // STATE-domain lookup: a state that was genuinely advanced past cannot be
+        // retroactively declared abandoned.
+        if let ChainLookup::Hit { .. } = consumed_chain.lookup(gs) {
             return Err(ClaraRegistrationError::ConsumedAlreadyTxidRegistered);
         }
     }
 
     // (10) Insert the heal txid into the active txid era
-    txid_chain.insert(current_tick, &heal_txid);
+    // Heals are written to CLARA's own chain, never the redeemed set.
+    heal_chain.insert(current_tick, &heal_txid);
 
     // (11) Insert each declared garbage state into the active garbage era
     for gs in &request.declared_garbage {
@@ -473,7 +560,7 @@ pub fn register_clara(
     }
 
     // (12) Return the canonical info for the caller to embed in the attestation
-    let active = txid_chain.active_era();
+    let active = heal_chain.active_era();
     Ok(ClaraRegistrationOk {
         heal_txid,
         healed_to_state_id,
@@ -533,7 +620,6 @@ mod tests {
             nonce: 0,
             epoch,
             client_sig: vec![],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             oracle_claim: None,
@@ -598,8 +684,15 @@ mod tests {
         let (dmap_input_hash, dmap_output_hash) = dmap_hashes.unwrap_or(([0u8; 32], [0u8; 32]));
         let rate_bps: u32 = 10;
         let commitment = axiom_core_logic::compute::compute_cheque_commitment(
-            &txid, &state_hash, &produced_state_id, wallet_email,
+            // §5.2.2c — `sender_wallet_id` and `created_at` became SIGNED on
+            // 2026-09-05. A CLARA heal cheque is a SELF-SEND, so the sender IS
+            // `wallet_email`; passing it keeps the fixture truthful rather than
+            // merely compiling. `created_at` is deliberately DIFFERENT from
+            // `epoch` so an argument-order swap changes the commitment and the
+            // signature check catches it.
+            &txid, &state_hash, &produced_state_id, wallet_email, wallet_email,
             amount, epoch,
+            0, // created_at — these fixtures do not exercise the stake-lock stamp
             rate_bps,
             &dmap_input_hash, &dmap_output_hash,
             None,
@@ -607,6 +700,7 @@ mod tests {
         );
         let signature = sk.sign(&commitment).to_bytes().to_vec();
         ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id,
@@ -675,7 +769,9 @@ mod tests {
         let txid = axiom_core_logic::compute::compute_txid(&tx);
         // Phase 5f Finding 4: state_hash binds (wallet_pk, healed_balance, wallet_seq)
         let state_hash = axiom_core_logic::compute::compute_state_hash(
-            &wallet_pk, healed_balance, wallet_seq, 0,
+            &wallet_pk, healed_balance, wallet_seq, 0, 0,
+            0, // §4.2a
+            0, &axiom_core_logic::types::WalletFormat::CURRENT, // §6b.13
         );
         ClaraRegistrationRequest {
             wallet_pk,
@@ -683,7 +779,17 @@ mod tests {
             heal_transaction: tx,
             declared_garbage: vec![make_state(0x11), make_state(0x12)],
             healed_balance,
+            declared_emission_claimed_epoch: 0,
+            declared_stake_floor_until: 0,
+            declared_wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         }
+    }
+
+    /// An empty REDEEMED set — the default for tests that are not exercising the
+    /// "consumed state was already redeemed" path. Same dimensions as the heal
+    /// chain so a size mismatch never masks a logic error.
+    fn empty_redeemed() -> BloomChain {
+        BloomChain::new(0, 100_000, 1000)
     }
 
     fn fresh_chains() -> (BloomChain, GarbageStateChain) {
@@ -708,7 +814,7 @@ mod tests {
         let expected_txid = axiom_core_logic::compute::compute_txid(&req.heal_transaction);
         let expected_consumed = req.heal_transaction.consumed_state_id;
         let expected_seq = req.heal_transaction.wallet_seq;
-        let result = register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50)
+        let result = register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect("happy path must succeed");
         assert_eq!(result.bloom_era_id, 0);
         assert_eq!(result.heal_txid, expected_txid);
@@ -739,7 +845,7 @@ mod tests {
         // and the cheque alone. tx.client_pk no longer matches → reject.
         req.wallet_pk = make_state(0xEE);
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::WalletPkMismatch)
         );
     }
@@ -764,7 +870,7 @@ mod tests {
         // This also changes the txid (client_pk is in compute_txid), so the
         // cheque->tx binding (5c) fires before (5e). Check we get one of the
         // two binding-related errors.
-        let err = register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50)
+        let err = register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect_err("must reject");
         assert!(
             matches!(
@@ -786,7 +892,7 @@ mod tests {
         // Mutating is_heal does NOT change compute_txid (is_heal is not in the
         // hash), so the cheques still bind to the tx. Only the is_heal check fires.
         assert_eq!(
-            register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::NotMarkedHeal)
         );
     }
@@ -799,7 +905,7 @@ mod tests {
         let mut req = make_request();
         req.heal_transaction.consumed_state_id = make_state(0x99);
         assert_eq!(
-            register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::HealTxidMismatch)
         );
     }
@@ -820,14 +926,18 @@ mod tests {
         let txid = axiom_core_logic::compute::compute_txid(&tx);
         let healed_balance = 1_000u64;
         let state_hash = axiom_core_logic::compute::compute_state_hash(
-            &wallet_pk, healed_balance, 7, 0,
-        );
+            &wallet_pk, healed_balance, 7, 0, 0,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
         let _req = ClaraRegistrationRequest {
             wallet_pk,
             heal_cheque: make_bundle(txid, make_state(0x21), &wallet_id, 500_000, 100, state_hash),
             heal_transaction: tx,
             declared_garbage: vec![make_state(0x33)],
             healed_balance,
+            declared_emission_claimed_epoch: 0,
+            declared_stake_floor_until: 0,
+            declared_wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         };
     }
 
@@ -837,7 +947,7 @@ mod tests {
         let mut req = make_request();
         req.heal_cheque.cheques.pop();
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::InsufficientSignatures)
         );
     }
@@ -849,7 +959,7 @@ mod tests {
         // Tamper with one cheque's amount → consistency fails
         req.heal_cheque.cheques[1].amount = 999_999;
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::InconsistentBundle)
         );
     }
@@ -877,7 +987,12 @@ mod tests {
             let sk_i = SigningKey::from_bytes(&[i; 32]);
             let pk_i = sk_i.verifying_key().to_bytes();
             let commit = axiom_core_logic::compute::compute_cheque_commitment(
-                &txid_h, &state_hash, &produced, receiver, amount, epoch,
+                // Now that `sender_wallet_id` is SIGNED, this fixture is
+                // stronger than it was: the cheque genuinely COMMITS to a
+                // sender that differs from the receiver, so the non-self-send
+                // it asserts on is cryptographically real and not just a field.
+                &txid_h, &state_hash, &produced, sender, receiver, amount, epoch,
+                0, // created_at
                 rate_bps,
                 &[0u8; 32], &[0u8; 32],
                 None,
@@ -887,6 +1002,7 @@ mod tests {
             let mut id = [0u8; 32];
             id[0] = i;
             cheques.push(ValidatorCheque {
+                fact_certificates: Vec::new(),
                 recall_target_tx_id: None,
                 txid: txid_h,
                 validator_id: id,
@@ -918,7 +1034,7 @@ mod tests {
         req.heal_cheque = ChequeBundle { cheques, fact_chain: None };
         let _ = pk; // unused
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::NotSelfSend)
         );
     }
@@ -930,7 +1046,7 @@ mod tests {
         // Replace signature with random bytes
         req.heal_cheque.cheques[0].signature = vec![0xDE; 64];
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::InvalidValidatorSignature)
         );
     }
@@ -941,7 +1057,7 @@ mod tests {
         let mut req = make_request();
         req.declared_garbage.clear();
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::EmptyGarbage)
         );
     }
@@ -950,9 +1066,9 @@ mod tests {
     fn test_register_clara_double_call_rejected_by_idempotency() {
         let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
         let req = make_request();
-        register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50).expect("first call ok");
+        register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None).expect("first call ok");
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 51),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 51, None),
             Err(ClaraRegistrationError::HealAlreadyRegistered)
         );
     }
@@ -964,8 +1080,68 @@ mod tests {
         // Phase 5f: consumed state is derived from tx.consumed_state_id.
         garbage.insert(10, &req.heal_transaction.consumed_state_id);
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::ConsumedAlreadyGarbage)
+        );
+    }
+
+    /// KI#43b: a consumed-chain hit on the HEALED-FROM state must surface as
+    /// the adjudicable `ConsumedHealedFromHit` (routed to the §12.4.4
+    /// barrier by the node handler) — NOT the terminal garbage-path error.
+    #[test]
+    fn test_register_clara_healed_from_hit_is_adjudicable_variant() {
+        let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
+        let req = make_request();
+        let mut consumed_chain = empty_redeemed();
+        consumed_chain.insert(10, &req.heal_transaction.consumed_state_id);
+        assert_eq!(
+            register_clara(&req, &mut txid, &empty_redeemed(), &consumed_chain, &mut garbage, &mut limiter, 50, None),
+            Err(ClaraRegistrationError::ConsumedHealedFromHit)
+        );
+    }
+
+    /// KI#43b regression (2026-07-29 live gate): the LIVE heal shape declares
+    /// the healed-from state ITSELF as garbage (the standard partial marker),
+    /// so the acquitted FP is looked up TWICE — check (9) AND the
+    /// declared-garbage cross-check. The v1 build skipped only check (9) and
+    /// stranded the acquitted victim on the second lookup with the terminal
+    /// `ConsumedAlreadyTxidRegistered`. The acquittal must cover every
+    /// lookup site of the acquitted state (§12.4.4 implementation note).
+    #[test]
+    fn test_register_clara_acquittal_covers_declared_garbage_lookup() {
+        let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
+        let mut req = make_request();
+        let healed_from = req.heal_transaction.consumed_state_id;
+        // Live shape: the healed-from state is also the (only) declared garbage.
+        req.declared_garbage = vec![healed_from];
+        let mut consumed_chain = empty_redeemed();
+        consumed_chain.insert(10, &healed_from); // the injected/bloom FP
+        register_clara(
+            &req, &mut txid, &empty_redeemed(), &consumed_chain,
+            &mut garbage, &mut limiter, 50, Some(&healed_from),
+        ).expect("acquitted FP must clear BOTH freshness lookups of the same state");
+    }
+
+    /// KI#43b: with a barrier-ACQUITTED verdict for exactly the healed-from
+    /// state, the freshness check skips the proven false positive and the
+    /// heal proceeds. An acquittal for a DIFFERENT state must not skip.
+    #[test]
+    fn test_register_clara_acquitted_state_skips_only_that_state() {
+        let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
+        let req = make_request();
+        let healed_from = req.heal_transaction.consumed_state_id;
+        let mut consumed_chain = empty_redeemed();
+        consumed_chain.insert(10, &healed_from);
+        // Acquitted for the hit state: proceeds past freshness (must be Ok —
+        // make_request is the happy-path fixture).
+        register_clara(&req, &mut txid, &empty_redeemed(), &consumed_chain, &mut garbage, &mut limiter, 50, Some(&healed_from))
+            .expect("acquitted false positive must heal");
+        // A verdict for some OTHER state must not skip the check.
+        let (mut txid2, mut garbage2, mut limiter2) = fresh_chains_with_limiter();
+        let other = make_state(0x77);
+        assert_eq!(
+            register_clara(&req, &mut txid2, &empty_redeemed(), &consumed_chain, &mut garbage2, &mut limiter2, 50, Some(&other)),
+            Err(ClaraRegistrationError::ConsumedHealedFromHit)
         );
     }
 
@@ -991,8 +1167,9 @@ mod tests {
         let dmap_out = [0xD2; 32];
         let healed_balance = 1_000_000u64;
         let state_hash = axiom_core_logic::compute::compute_state_hash(
-            &wallet_pk, healed_balance, wallet_seq, 0,
-        );
+            &wallet_pk, healed_balance, wallet_seq, 0, 0,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
         let cheques = vec![
             make_signed_cheque_inner_with_state_hash(
                 1, txid, produced, &wallet_id, amount, epoch,
@@ -1010,8 +1187,11 @@ mod tests {
             heal_transaction: tx,
             declared_garbage: vec![make_state(0x11)],
             healed_balance,
+            declared_emission_claimed_epoch: 0,
+            declared_stake_floor_until: 0,
+            declared_wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         };
-        let result = register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50)
+        let result = register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect("DMAP heal cheques must verify");
         assert_eq!(result.heal_txid, txid);
     }
@@ -1039,8 +1219,9 @@ mod tests {
             hex::encode(&wallet_pk[..4]));
         let healed_balance = 1_000u64;
         let state_hash = axiom_core_logic::compute::compute_state_hash(
-            &wallet_pk, healed_balance, 5, 0,
-        );
+            &wallet_pk, healed_balance, 5, 0, 0,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
         let cheques = vec![
             make_signed_cheque_inner_with_state_hash(
                 1, txid, produced, &synthetic, amount, epoch, None, state_hash),
@@ -1055,11 +1236,14 @@ mod tests {
             heal_transaction: tx,
             declared_garbage: vec![make_state(0x11)],
             healed_balance,
+            declared_emission_claimed_epoch: 0,
+            declared_stake_floor_until: 0,
+            declared_wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         };
         // Either WalletPkMismatch (verify_pk_binding rejects the synthetic
         // wallet_id) or InvalidWalletId (parse fails) is acceptable. The point
         // is the heal must NOT register cleanly under the placeholder.
-        let err = register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50)
+        let err = register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect_err("synthetic sender_wallet_id must be rejected");
         assert!(
             matches!(err, ClaraRegistrationError::WalletPkMismatch),
@@ -1079,7 +1263,7 @@ mod tests {
         // Inflating the declared balance breaks the recomputed hash check.
         req.healed_balance = req.healed_balance.wrapping_add(999_999);
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::HealedBalanceMismatch)
         );
     }
@@ -1093,7 +1277,7 @@ mod tests {
         let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
         let req = make_request();
         let expected_balance = req.healed_balance;
-        let ok = register_clara(&req, &mut txid, &mut garbage, &mut limiter, 50)
+        let ok = register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect("happy path");
         assert_eq!(ok.healed_balance, expected_balance);
         assert_ne!(expected_balance, 0,
@@ -1113,10 +1297,10 @@ mod tests {
         // is the 4th request hits RateLimited.
         let req = make_request();
         for _ in 0..MAX_CLARA_REGISTRATIONS_PER_HOUR_PER_WALLET {
-            let _ = register_clara(&req, &mut txid, &mut garbage, &mut limiter, 100);
+            let _ = register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 100, None);
         }
         assert_eq!(
-            register_clara(&req, &mut txid, &mut garbage, &mut limiter, 100),
+            register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 100, None),
             Err(ClaraRegistrationError::RateLimited)
         );
     }
@@ -1172,7 +1356,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50),
+            register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None),
             Err(ClaraRegistrationError::TooManyGarbageStates)
         );
     }
@@ -1190,7 +1374,7 @@ mod tests {
                 s
             })
             .collect();
-        register_clara(&req, &mut txid_chain, &mut garbage, &mut limiter, 50)
+        register_clara(&req, &mut txid_chain, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
             .expect("MAX_DECLARED_GARBAGE entries must pass");
     }
 
@@ -1202,5 +1386,52 @@ mod tests {
         // it would fail to compile (the field no longer exists).
         let req = make_request();
         let _ = req.heal_cheque.cheques.len();  // bundle is required
+    }
+
+    /// The freshness check must consult the REDEEMED set, not CLARA's heal chain.
+    ///
+    /// Before 2026-07-28 both checks read the heal chain — which nothing but
+    /// `register_clara` writes — so a heal whose consumed state had actually been
+    /// REDEEMED sailed through. This pins the fix: same request, empty redeemed set
+    /// → accepted; redeemed set containing the consumed state → refused.
+    #[test]
+    fn freshness_check_consults_the_redeemed_set_not_the_heal_chain() {
+        // Baseline: with an EMPTY redeemed set the heal is accepted.
+        let (mut txid, mut garbage, mut limiter) = fresh_chains_with_limiter();
+        let req = make_request();
+        let ok = register_clara(&req, &mut txid, &empty_redeemed(), &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
+            .expect("baseline heal must be accepted");
+        let consumed = ok.healed_from_state_id;
+
+        // Now the SAME heal, but the consumed state is present in the REDEEMED
+        // set — i.e. that state was actually spent. Must be refused.
+        let (mut txid2, mut garbage2, mut limiter2) = fresh_chains_with_limiter();
+        let mut consumed_set = empty_redeemed();
+        consumed_set.insert(10, &consumed);
+        let err = register_clara(&req, &mut txid2, &empty_redeemed(), &consumed_set, &mut garbage2, &mut limiter2, 50, None)
+            .expect_err("a heal from an already-REDEEMED state must be refused");
+        assert!(
+            // KI#43b: the healed-from hit surfaces as the ADJUDICABLE variant
+            // (routed to the §12.4.4 barrier; still a refusal at this layer).
+            matches!(err, ClaraRegistrationError::ConsumedHealedFromHit),
+            "expected ConsumedHealedFromHit, got {err:?}"
+        );
+    }
+
+    /// Heal txids must NOT land in the redeemed set — that would make
+    /// `/query-txid` answer REDEEMED for a merely-healed txid, the pollution the
+    /// 2026-07-07 "ONE txid domain" decision removed.
+    #[test]
+    fn heal_txids_are_written_to_the_heal_chain_only() {
+        let (mut heal, mut garbage, mut limiter) = fresh_chains_with_limiter();
+        let redeemed = empty_redeemed();
+        let req = make_request();
+        let ok = register_clara(&req, &mut heal, &redeemed, &empty_redeemed(), &mut garbage, &mut limiter, 50, None)
+            .expect("heal accepted");
+
+        assert!(matches!(heal.lookup(&ok.heal_txid), ChainLookup::Hit { .. }),
+            "heal chain must record the heal (idempotency depends on it)");
+        assert!(matches!(redeemed.lookup(&ok.heal_txid), ChainLookup::Miss),
+            "redeemed set must NOT learn heal txids — that is domain pollution");
     }
 }

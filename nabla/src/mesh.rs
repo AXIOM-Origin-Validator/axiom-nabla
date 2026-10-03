@@ -111,7 +111,24 @@ pub struct GossipMesh {
     /// Nodes that have announced lost upstream (seeking TARDIS parent).
     orphaned_nodes: HashMap<NodeId, NablaAddress>,
     /// Nodes that have open D slots (can accept TARDIS children).
+    ///
+    /// ⚠ §5.6a-bis: every address in here is one WE OBSERVED (composed from a
+    /// connection) or one a peer observed and relayed in a PX `PeerInfo` —
+    /// NEVER the subject's own claim. `find_tardis_parent` dials straight out
+    /// of this map, so a claim admitted here is a claim we dial.
     available_slots: HashMap<NodeId, NablaAddress>,
+    /// §5.6a-bis — `SlotAvailable` hints discarded because we hold no observed
+    /// address for the announcing node, so its slot is not dialable.
+    ///
+    /// RULE 3 shape 2: without this counter a mesh that drops every hint and a
+    /// mesh that never receives one read identically on `/status`. Surfaced as
+    /// `slot_hints_dropped_unobserved`.
+    slot_hints_dropped_unobserved: u64,
+    /// §5.6a-bis — node_ids whose `NewNode` announcement we have already
+    /// relayed. This is the relay dedup key ONLY. It replaced `known_nodes`,
+    /// which stopped being usable as the dedup once `NewNode` correctly stopped
+    /// writing an (unverified, self-claimed) address into the node directory.
+    seen_new_nodes: HashSet<NodeId>,
 
     /// Phase B Layer 4: peers currently under mesh-wide quarantine.
     /// `forward_targets` and `active_peers` skip these. The set is
@@ -172,6 +189,8 @@ impl GossipMesh {
             latency_penalty: HashMap::new(),
             orphaned_nodes: HashMap::new(),
             available_slots: HashMap::new(),
+            slot_hints_dropped_unobserved: 0,
+            seen_new_nodes: HashSet::new(),
             quarantined_peers: HashSet::new(),
         }
     }
@@ -963,15 +982,39 @@ impl GossipMesh {
                 }
                 false // Don't relay LostUpstream (1-hop is sufficient)
             }
-            TopologyHint::SlotAvailable { node_id, address, open_slots } => {
+            TopologyHint::SlotAvailable { node_id, open_slots } => {
                 // open_slots = 0 means "node is now full" (negative info).
                 // Must propagate so peers stop preferring this node as a
                 // dc=1 → writer-eligible candidate after its slots fill.
                 let mut changed = false;
                 if *open_slots > 0 {
-                    let was_new = !self.available_slots.contains_key(node_id);
-                    self.available_slots.insert(*node_id, address.clone());
-                    changed = changed || was_new;
+                    // ── §5.6a-bis: the ADDRESS comes from OUR record, never the hint ──
+                    // ⚠ This line used to be `self.available_slots.insert(*node_id,
+                    // address.clone())` — the address the SUBJECT put in its own
+                    // hint, relayed to us verbatim by an arbitrary number of hops.
+                    // That made `available_slots` a dial table populated by
+                    // unverified third-party claims, and `find_tardis_parent`
+                    // dials straight out of it. Correct reading: we may only dial
+                    // an address someone actually OBSERVED — composed at Hello /
+                    // TardisAttachRequest, or relayed inside a PX `PeerInfo` by a
+                    // peer that observed it (§5.6a-bis point 3 permits
+                    // propagating what you saw; it never permits a self-claim).
+                    //
+                    // No observed record ⇒ we know a slot exists but not where.
+                    // That is not a dialable candidate, so it is dropped and
+                    // COUNTED — a silent drop would read exactly like "no hints
+                    // ever arrived" (RULE 3 shape 2).
+                    match self.known_nodes.get(node_id).map(|p| p.address.clone()) {
+                        Some(observed) => {
+                            let was_new = !self.available_slots.contains_key(node_id);
+                            self.available_slots.insert(*node_id, observed);
+                            changed = changed || was_new;
+                        }
+                        None => {
+                            self.slot_hints_dropped_unobserved =
+                                self.slot_hints_dropped_unobserved.saturating_add(1);
+                        }
+                    }
                 } else if self.available_slots.remove(node_id).is_some() {
                     changed = true;
                 }
@@ -999,23 +1042,28 @@ impl GossipMesh {
                 }
                 changed
             }
-            TopologyHint::NewNode { node_id, address } => {
-                // Add to known_nodes if not already there
-                if !self.known_nodes.contains_key(node_id) {
-                    self.insert_known_node(
-                        *node_id,
-                        PeerInfo {
-                            node_id: *node_id,
-                            address: address.clone(),
-                            last_seen: 0,
-                            tardis_up: None,
-                            has_d_open: false, open_slots: 0,
-                            messages_delivered: 0,
-                            connected_since: 0,
-            txid_service: String::new(),
-                        },
-                    );
-                    true // New node — relay
+            TopologyHint::NewNode { node_id } => {
+                // ── §5.6a-bis: a JOIN ANNOUNCEMENT, not an address record ──
+                // ⚠ This arm used to `insert_known_node(*node_id, PeerInfo {
+                // address: address.clone(), .. })` — writing the new node's OWN
+                // claim about where it lives into the long-term directory that
+                // `find_tardis_parent` and the attach passes dial from. A node
+                // that had never been contacted could therefore place itself
+                // anywhere in every peer's table, which is precisely the
+                // self-assertion §5.6a-bis removes. Fixing only `Hello` would
+                // have left this open.
+                //
+                // Correct reading: we relay the fact that someone joined, and
+                // learn WHERE only when we (or a peer that observed them) have
+                // an actual connection to compose from. Discovery still closes —
+                // the joiner dials its seeds, they compose its address, and PX
+                // spreads that observed record.
+                //
+                // Relay once per node so the announcement still propagates
+                // without looping: `known_nodes` is no longer the dedup key
+                // (we deliberately do not write it here), so `seen_new_nodes` is.
+                if self.seen_new_nodes.insert(*node_id) {
+                    true // first time we have heard of them — relay onward
                 } else {
                     false
                 }
@@ -1032,18 +1080,37 @@ impl GossipMesh {
 
     /// Generate a SlotAvailable hint (when we have an open D slot).
     pub fn announce_slot_available(&self, open_slots: u8) -> MeshAction {
+        // §5.6a-bis: identity + slot count only. We do not tell anyone where we
+        // are; peers that have observed us already know, and peers that have not
+        // must observe us before they can dial. See `TopologyHint::SlotAvailable`.
         MeshAction::BroadcastTopology(TopologyHint::SlotAvailable {
             node_id: self.my_node_id,
-            address: self.my_address.clone(),
             open_slots,
         })
     }
 
+    /// §5.6a-bis — how many `SlotAvailable` hints were dropped for want of an
+    /// observed address. Exposed so `/status` can prove the path runs.
+    pub fn slot_hints_dropped_unobserved(&self) -> u64 {
+        self.slot_hints_dropped_unobserved
+    }
+
+    /// §6.3.7 — measured round-trip time to a peer, if we have a sample.
+    ///
+    /// `None` = UNMEASURED, and that is a distinct answer from "fast": a peer we
+    /// have never timed is never pruned for latency, so callers must not read
+    /// `None` as zero. Added 2026-08-26 because `/status` was reporting
+    /// `latency_ms: null` for every bootstrap peer on a healthy mesh — the data
+    /// existed here and simply never reached the surface (RULE 3 shape 4).
+    pub fn peer_rtt_ms(&self, node_id: &NodeId) -> Option<f32> {
+        self.peer_rtt_ms.get(node_id).copied()
+    }
+
     /// Generate a NewNode hint (when we first join the network).
     pub fn announce_new_node(&self) -> MeshAction {
+        // §5.6a-bis: identity only — see `TopologyHint::NewNode`.
         MeshAction::BroadcastTopology(TopologyHint::NewNode {
             node_id: self.my_node_id,
-            address: self.my_address.clone(),
         })
     }
 
@@ -1222,11 +1289,21 @@ pub fn encode_nabla_address(addr: &NablaAddress) -> String {
             bytes.extend_from_slice(&port.to_be_bytes());
             base32_encode(&bytes)
         }
+        // A name is ALREADY human-readable — that is the whole point of this
+        // encoding — so it passes through as-is. The ':' is what tells decode
+        // it is a name (base32 never produces one).
+        NablaAddress::Name { host, port } => format!("{host}:{port}"),
     }
 }
 
 /// Decode a human-readable Base32 string back to a Nabla address.
 pub fn decode_nabla_address(code: &str) -> Result<NablaAddress, NablaError> {
+    // Name form (see encode): "host:port". base32 output never contains ':'.
+    if let Some((host, port)) = code.rsplit_once(':') {
+        let port: u16 = port.parse()
+            .map_err(|_| NablaError::SmtError("invalid nabla address port".into()))?;
+        return Ok(NablaAddress::Name { host: host.to_string(), port });
+    }
     let bytes = base32_decode(code)?;
     match bytes.len() {
         6 => {
@@ -1329,8 +1406,14 @@ mod tests {
         assert_eq!(mesh.known_node_count(), 3);
     }
 
+    // KI#64 (2026-10-01): `set_my_address` + its test were deleted (the
+    // §6.1.2 own-name re-resolve that called it was superseded by §5.6a-bis
+    // peer-observed IPs). The stray `#[test]` that sat above that test's doc
+    // comment had detached THIS fn's own attribute, so the self-announcement
+    // test below silently never ran; its `#[test]` is restored here.
     #[test]
     fn self_announcement_refreshes_address_of_active_peer() {
+
         // A self-announcement (Hello) is authoritative for the dial-back
         // address: a peer that first advertised a wildcard bind and then
         // corrected it must become re-dialable. Lifetime counters stay.
@@ -1719,29 +1802,91 @@ mod tests {
         assert_eq!(mesh.orphan_count(), 1);
     }
 
-    #[test]
-    fn topology_slot_available() {
-        let mut mesh = GossipMesh::new(node_id(0), make_address(0));
-
-        mesh.apply_topology_hint(&TopologyHint::SlotAvailable {
-            node_id: node_id(7),
-            address: make_address(7),
-            open_slots: 1,
+    /// Helper: record `nid` the ONLY legitimate way — as a peer some node
+    /// actually observed and relayed to us in a PX `PeerInfo` (§5.6a-bis
+    /// point 3). Never a self-claim.
+    fn observe(mesh: &mut GossipMesh, nid: NodeId, addr: NablaAddress) {
+        mesh.merge_peer_info(PeerInfo {
+            node_id: nid,
+            address: addr,
+            last_seen: 1,
+            tardis_up: None,
+            has_d_open: false,
+            open_slots: 0,
+            messages_delivered: 0,
+            connected_since: 1,
+            txid_service: String::new(),
         });
-
-        assert_eq!(mesh.available_slot_count(), 1);
     }
 
+    /// §5.6a-bis — a `SlotAvailable` hint is IDENTITY ONLY. It may never by
+    /// itself turn an unobserved node into something we will dial.
+    ///
+    /// Before the fix this test read `apply(hint); assert available_slot_count()
+    /// == 1` — it asserted exactly the behaviour that let a relayed self-claim
+    /// populate the dial table.
     #[test]
-    fn topology_new_node_discovered() {
+    fn topology_slot_available_requires_an_observed_address() {
         let mut mesh = GossipMesh::new(node_id(0), make_address(0));
 
-        mesh.apply_topology_hint(&TopologyHint::NewNode {
-            node_id: node_id(9),
-            address: make_address(9),
+        // We have never observed node 7. We now know a slot exists — but not
+        // where it is, so it is NOT a dial candidate.
+        mesh.apply_topology_hint(&TopologyHint::SlotAvailable {
+            node_id: node_id(7),
+            open_slots: 1,
         });
+        assert_eq!(
+            mesh.available_slot_count(), 0,
+            "an unobserved node must never become a dial target from a hint alone"
+        );
+        assert_eq!(
+            mesh.slot_hints_dropped_unobserved(), 1,
+            "the drop must be COUNTED — silent, it is indistinguishable from 'no hints arrived'"
+        );
 
-        assert_eq!(mesh.known_node_count(), 1);
+        // POSITIVE CONTROL. Observe node 7 legitimately, replay the SAME hint,
+        // and it must now take effect. Without this half, the assertions above
+        // would pass just as well if the whole arm were dead code.
+        observe(&mut mesh, node_id(7), make_address(7));
+        mesh.apply_topology_hint(&TopologyHint::SlotAvailable {
+            node_id: node_id(7),
+            open_slots: 1,
+        });
+        assert_eq!(
+            mesh.available_slot_count(), 1,
+            "an OBSERVED node's slot hint must be actionable"
+        );
+        assert_eq!(
+            mesh.slot_hints_dropped_unobserved(), 1,
+            "no further drop once the address is known"
+        );
+    }
+
+    /// §5.6a-bis — `NewNode` announces that someone joined; it does NOT seed a
+    /// dialable address. Previously this test asserted `known_node_count() == 1`
+    /// from the hint alone, i.e. that a stranger's self-claim entered the
+    /// long-term directory the attach passes dial from.
+    #[test]
+    fn topology_new_node_is_identity_only() {
+        let mut mesh = GossipMesh::new(node_id(0), make_address(0));
+
+        mesh.apply_topology_hint(&TopologyHint::NewNode { node_id: node_id(9) });
+
+        assert_eq!(
+            mesh.known_node_count(), 0,
+            "a join announcement must not write an address into the node directory"
+        );
+    }
+
+    /// The announcement must still propagate exactly once per node — dropping
+    /// the address must not cost us loop-free relay.
+    #[test]
+    fn topology_new_node_relays_once_then_stops() {
+        let mut mesh = GossipMesh::new(node_id(0), make_address(0));
+        let hint = TopologyHint::NewNode { node_id: node_id(9) };
+
+        assert!(mesh.apply_topology_hint(&hint), "first sighting must relay");
+        assert!(!mesh.apply_topology_hint(&hint), "second sighting must NOT relay — no gossip loop");
     }
 
     // ── TARDIS Self-Healing ──
@@ -1750,10 +1895,11 @@ mod tests {
     fn find_tardis_parent_from_available() {
         let mut mesh = GossipMesh::new(node_id(0), make_address(0));
 
-        // Announce a slot
+        // §5.6a-bis: the slot is only reachable once we hold an OBSERVED
+        // address for node 5 — the hint itself carries none.
+        observe(&mut mesh, node_id(5), make_address(5));
         mesh.apply_topology_hint(&TopologyHint::SlotAvailable {
             node_id: node_id(5),
-            address: make_address(5),
             open_slots: 1,
         });
 
@@ -1800,11 +1946,12 @@ mod tests {
         match action {
             MeshAction::BroadcastTopology(TopologyHint::SlotAvailable {
                 node_id: nid,
-                address,
                 open_slots,
             }) => {
+                // §5.6a-bis: no address is emitted. The assertion that used to
+                // sit here (`address == make_address(0xBB)`) was pinning the
+                // self-assertion this change removes.
                 assert_eq!(nid, node_id(0xBB));
-                assert_eq!(address, make_address(0xBB));
                 assert_eq!(open_slots, 1);
             }
             _ => panic!("Expected BroadcastTopology(SlotAvailable)"),

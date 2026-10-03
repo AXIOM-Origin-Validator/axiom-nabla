@@ -6,8 +6,12 @@
 //   Single-node (production):
 //     nabla-ceremony --config ~/.axiom/node.toml --root-keys /path/to/root-keys/
 //
-//   Batch/dev (sim testing):
-//     nabla-ceremony --dev --base-dir /path/to/AXIOM_DATA_DIR --count 50
+//   Batch (genesis set — the G1 ceremony, rehearsal AND production; also sim testing):
+//     nabla-ceremony --batch --base-dir /path/to/AXIOM_DATA_DIR --count 50
+//
+// `--batch` (renamed from `--dev`, owner ruling 2026-10-02; no alias) selects a
+// MODE only: mint 3 root keys + `count` NBCs under one base dir. It relaxes
+// nothing — the NBCs, keys and signatures are the same real ones either way.
 
 use std::path::PathBuf;
 
@@ -16,7 +20,7 @@ fn main() {
 
     let mut config_path: Option<PathBuf> = None;
     let mut root_keys_dir: Option<PathBuf> = None;
-    let mut dev_mode = false;
+    let mut batch_mode = false;
     let mut base_dir: Option<PathBuf> = None;
     let mut count: usize = 50;
 
@@ -35,8 +39,8 @@ fn main() {
                     root_keys_dir = Some(PathBuf::from(&args[i]));
                 }
             }
-            "--dev" => {
-                dev_mode = true;
+            "--batch" => {
+                batch_mode = true;
             }
             "--base-dir" | "--base" | "-d" => {
                 i += 1;
@@ -65,8 +69,8 @@ fn main() {
     }
 
     // Validate mutual exclusivity
-    if config_path.is_some() && dev_mode {
-        eprintln!("ERROR: --config and --dev are mutually exclusive");
+    if config_path.is_some() && batch_mode {
+        eprintln!("ERROR: --config and --batch are mutually exclusive");
         eprintln!();
         print_usage();
         std::process::exit(1);
@@ -109,12 +113,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if dev_mode {
-        // ── Batch/dev mode ──
+    } else if batch_mode {
+        // ── Batch mode ──
         let base_dir = match base_dir {
             Some(d) => d,
             None => {
-                eprintln!("ERROR: --dev requires --base-dir");
+                eprintln!("ERROR: --batch requires --base-dir");
                 eprintln!();
                 print_usage();
                 std::process::exit(1);
@@ -146,7 +150,7 @@ fn main() {
         eprintln!("  Sim can now load these with: nabla-sim --base-dir {}", base_dir.display());
     } else {
         // No mode specified
-        eprintln!("ERROR: Specify --config <path> for single-node or --dev for batch mode");
+        eprintln!("ERROR: Specify --config <path> for single-node or --batch for batch mode");
         eprintln!();
         print_usage();
         std::process::exit(1);
@@ -156,15 +160,15 @@ fn main() {
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  nabla-ceremony --config <node.toml> --root-keys <dir>   Single-node (production)");
-    eprintln!("  nabla-ceremony --dev --base-dir <DIR> [--count <N>]     Batch mode (dev/sim)");
+    eprintln!("  nabla-ceremony --batch --base-dir <DIR> [--count <N>]   Batch mode (genesis set / sim)");
     eprintln!();
     eprintln!("Single-node mode:");
     eprintln!("  --config <path>      Path to node.toml (name + port)");
     eprintln!("  --root-keys <dir>    Path to shared root authority keys (required)");
     eprintln!("                       Contains root_{{1,2,3}}.{{pub,key}} from genesis ceremony");
     eprintln!();
-    eprintln!("Batch/dev mode:");
-    eprintln!("  --dev                Enable batch mode (generates its own root keys)");
+    eprintln!("Batch mode:");
+    eprintln!("  --batch              Enable batch mode (generates its own root keys; relaxes nothing)");
     eprintln!("  --base-dir <path>    Path to AXIOM_DATA_DIR");
     eprintln!("  --count <N>          Total nodes including 10 genesis (default: 50)");
     eprintln!();

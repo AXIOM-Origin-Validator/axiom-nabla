@@ -1,3 +1,12 @@
+// ⚠ RETIRED DETECTOR (2026-09-30, Fork Settlement §9o [R56], W2 — KI#235): this
+// harness drives check-3, the `previous_states`-based seq-fork ban that flooded
+// `SeqForkBan`. check-3 is DELETED and `SeqForkBan` is a dropped, counted
+// tombstone (`seqforkban_dropped`), so on a W2+ build its positive scenario does
+// NOT ban — read its output as history, not as a gate. Forks are judged only on
+// self-proving `ForkClaim` evidence (`ban::verify_fork_claim`); the in-process
+// gate is `nabla/src/fork_detection_mesh.rs` (S1–S13, fork_retire_proof_*), the
+// live lost-flood gate mode is still owed (§9o proof obligations).
+//
 // Double-spend (seq-fork) ban — LIVE positive/negative injection harness.
 //
 // Talks to a running nabla-node mesh over real TCP (length-prefixed bincode
@@ -12,18 +21,32 @@
 // that verify under the carried pks exactly as the shipped verifiers check them,
 // hitting the identical code path a genuine cross-node double-spend would.
 //
+// SHAPE (KI#46 check-3 alignment, reworked 2026-07-30): a ban requires a PROVEN
+// same-parent fork — the incoming update's `old_state` must equal the receiving
+// node's authoritative `previous_states[W]`. So every scenario is 3-STEP:
+//   1. base X at seq-1              (establish the wallet)
+//   2. A' consuming X at seq        (ADOPTION records previous_states[W] = X —
+//                                    `put()` records a parent only on REPLACE)
+//   3. B' also consuming X at seq   (two children of X = the provable fork)
+// The pre-rework harness injected parent-less A/B pairs, which correctly no
+// longer banned, making every ban assertion vacuous.
+//
 // Scenarios (all assert via QueryWalletStateRequest across EVERY node):
-//   DS-POS    two k3-attested, WALLET-AUTHORED successors at the same wallet_seq
-//             -> every node BANS the wallet (status flips to BANNED so §4.6 reads
-//             it). This is the inflation-closing positive path.
-//   DS-FORGE  same fork shape, both k3-attested, but client_pk=0 / no client_sig
-//             (the framing attack: forged validator sigs on a victim's wallet_id)
-//             -> NOT banned (anti-framing authorship gate). Proves the framing
-//             hole is closed on the live binary.
-//   DS-ADV    authored A' at seq=5 then authored B' at a HIGHER seq=6 -> normal
-//             sequential advance, NOT banned.
-//   DS-SUBQ   authored A' at seq=5 then an authored conflict at seq=5 with only
-//             k=2 sigs -> sub-quorum, NOT banned.
+//   DS-POS    3-step, both k3-attested + WALLET-AUTHORED -> every node BANS the
+//             wallet (status flips to BANNED so §4.6 reads it). The
+//             inflation-closing positive path.
+//   DS-FORGE  same shape but client_pk=0 / no client_sig (the framing attack:
+//             forged validator sigs on a victim's wallet_id) -> post-KI#46
+//             zero-pk flip the update is DROPPED outright (YPX-009 enforced), so
+//             no entry ever exists and no ban can be framed.
+//   DS-ADV    A' at seq=5 (parent X) then B' at a HIGHER seq=6 (parent A') ->
+//             normal sequential advance, NOT banned.
+//   DS-CONT   A' at seq=5 (parent X) then B' at the SAME seq=5 with parent A'
+//             (the held head) -> a redeem's chain continuation, NOT banned. This
+//             is the shape that false-banned honest wallet A in gate run
+//             1785338039 (Core keeps wallet_seq unchanged on receive).
+//   DS-SUBQ   same-parent conflict at seq=5 with only k=2 sigs -> sub-quorum, the
+//             fork is unprovable, NOT banned.
 //
 // Usage: dsfork_live_inject [addr ...]   (default 127.0.0.1:7300..=7309)
 
@@ -39,6 +62,28 @@ use axiom_nabla::types::{GossipMessage, SeqProof, SeqProofSig};
 use axiom_nabla::wire_client::QueryWalletStateRequest;
 
 type B32 = [u8; 32];
+
+/// KI#241 F-2 (2026-10-01): a redeem leg CARRIES its cheque's origin and every
+/// node refuses it unless `origin.preimage.txid(origin.epoch) == cheque txid`
+/// (`nabla_wire::cheque_origin_matches`). A probe's txid can therefore no
+/// longer be an arbitrary literal: the literal is now a TAG, and the txid on
+/// the wire is the txid of this probe origin.
+fn probe_origin(tag: &[u8; 32]) -> axiom_core_logic::types::OriginRecord {
+    axiom_core_logic::types::OriginRecord {
+        preimage: axiom_core_logic::types::WitnessPreimage {
+            consumed_state_id: *tag, client_pk: [0xEE; 32], wallet_seq: 1,
+            receiver_wallet_id: "probe@axiom.internal/0123456789".to_string(), amount: 1_000, nonce: 1,
+        },
+        epoch: 7,
+        kind: axiom_core_logic::types::LegKind::Send,
+    }
+}
+
+/// The wire txid of probe TAG `tag` (see [`probe_origin`]).
+fn probe_txid(tag: &[u8; 32]) -> [u8; 32] {
+    let o = probe_origin(tag);
+    o.preimage.txid(o.epoch)
+}
 
 // Per-run nonce stamped into byte [2] of every id, so each run targets brand-new
 // wallet/state ids and never collides with a wallet a prior run already banned
@@ -104,13 +149,19 @@ fn query(addr: &str, wallet: &B32) -> Option<(String, Vec<u8>)> {
 /// k=`n` SeqProof over `compute_receipt_commitment(tx, …, wallet_seq, …)`, signed
 /// by `n` distinct self-generated Ed25519 keypairs (mirrors the shipped
 /// verify_seq_proof inputs exactly).
-fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize) -> SeqProof {
+fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize, leg_client_pk: B32, leg_consumed: B32, leg_new_state: B32) -> SeqProof {
+    let tag = tx; // KI#241 F-2: the caller's tx is a TAG
+    let tx = &probe_txid(tag);
+    let tx_for_leg = tx;
     let state_hash = [0x5a_u8; 32];
-    let commitment_hash = [0x7c_u8; 32];
+    let redeem = axiom_core_logic::types::RedeemPreimage { cheque_txid: *tx_for_leg, receiver_pk: leg_client_pk, new_balance: 0, new_state_id: leg_new_state, consumed_state_id: leg_consumed };
+    let commitment_hash = redeem.commitment_hash();
     let (epoch, is_dev_class) = (7u64, false);
     let commitment = axiom_core_logic::compute::compute_receipt_commitment(
         tx, &state_hash, wallet_seq, &commitment_hash, epoch, is_dev_class,
         None,
+        None, // CI — P3.6 trailing arg
+        None, // §32.3 sender_state — send/inject path, no lineage
     );
     let sigs = (0..n)
         .map(|i| {
@@ -124,32 +175,46 @@ fn mint_seq_proof(tx: &B32, wallet_seq: u64, n: usize) -> SeqProof {
             }
         })
         .collect();
-    SeqProof { state_hash, commitment_hash, epoch, is_dev_class, sigs, oods_flag: None }
+    SeqProof { state_hash, commitment_hash, epoch, is_dev_class, sigs, oods_flag: None, confidence_index: None, sender_state: None, required_k: 3, preimage: axiom_nabla::types::LegPreimage::Redeem { redeem, cheque: probe_origin(tag) } /* Fork Settlement W7a: the leg is a GENUINE redeem leg bound to this probe's carrier (cheque_txid = tx, receiver = client_pk, consumed, produced) and the k sign over its recompute — W7a verifies redeem legs on the flood, so the pre-W7a unit `Redeem` ("no preimage") would now be refused at the leg check and this probe would measure THAT instead of its target */, declared: axiom_nabla::types::DeclaredState { balance: 0, wallet_seq: wallet_seq } /* W7b: the seq the k signed rides with a redeem leg */ }
 }
 
 /// A StateUpdate carrying a k=`n` SeqProof for (wid, new_state, wallet_seq). When
 /// `wallet` is Some, it is wallet-AUTHORED (non-zero client_pk + a valid client_sig
 /// over the §32 wallet-state payload); when None, it is forged/unauthored (zero pk).
+///
+/// `old_state` is the PARENT this advance consumed — load-bearing since the KI#46
+/// check-3 alignment: the dsfork ban fires only when `old_state` equals the
+/// receiving node's authoritative `previous_states[W]`. All-zero = parent unknown
+/// (never ban material). Hence the 3-step scenario shape below: establish base X,
+/// adopt A′ consuming X (which is what makes the node record X as W's parent —
+/// `put()` records a parent only when REPLACING an entry), then inject B′ also
+/// consuming X. Two children of X at the same seq = the provable double-spend.
+#[allow(clippy::too_many_arguments)]
 fn seq_update(
     wallet: Option<&Ed25519Signer>,
     wid: &B32,
     new_state: &B32,
+    old_state: &B32,
     tx: &B32,
     tick: u64,
     wallet_seq: u64,
     n_sigs: usize,
 ) -> WireMessage {
-    let proof = mint_seq_proof(tx, wallet_seq, n_sigs);
+    let tag = tx; // KI#241 F-2: the caller's tx is a TAG; the wire txid is its probe origin's
+    let tx = &probe_txid(tag);
     let (client_pk, client_sig) = match wallet {
         Some(sk) => {
-            let payload = client_state_sign_payload(wid, new_state, tx, tick);
+            let payload = client_state_sign_payload(wid, new_state, tx);
             (sk.public_key_bytes(), sk.sign(&payload))
         }
         None => ([0u8; 32], vec![0u8; 64]),
     };
+    let proof = mint_seq_proof(tag, wallet_seq, n_sigs, client_pk, *old_state, *new_state);
     WireMessage::Gossip(GossipMessage::StateUpdate {
+        is_genesis_claim: false,
         wallet_id: *wid,
         new_state: *new_state,
+        old_state: *old_state,
         tx_hash: *tx,
         tick,
         wallet_seq,
@@ -159,6 +224,11 @@ fn seq_update(
         amount: 0,
         fee_breakdown: Vec::new(),
     })
+}
+
+/// Zero id — "no parent" (`old_state` unknown), used for a base establishment.
+fn no_parent() -> B32 {
+    [0u8; 32]
 }
 
 fn sleep(ms: u64) {
@@ -206,8 +276,12 @@ fn main() {
         let mut banned = 0usize;
         for addr in &nodes {
             match query(addr, &w) {
-                Some((s, _)) => {
-                    println!("  {addr}: {s}");
+                Some((s, head)) => {
+                    // `head=` is load-bearing for the CLARA propagation gate:
+                    // status alone cannot tell you WHICH head a node holds, so a
+                    // mesh that is converged and one that is split both read
+                    // "NORMAL" everywhere.
+                    println!("  {addr}: {s} head={}", hex16(&head));
                     if s == "BANNED" {
                         banned += 1;
                     }
@@ -235,6 +309,28 @@ fn main() {
                 return true;
             }
             for a in &missing {
+                send_oneway(a, msg);
+            }
+            sleep(400);
+        }
+        false
+    };
+
+    // Establish a SPECIFIC head mesh-wide. Presence alone is not enough for the
+    // 3-step fork shape: step 2 (A′ consuming X) must actually REPLACE X on every
+    // node, because `put()` records `previous_states[W]` only on replacement —
+    // that recorded parent is the exact discriminator the ban predicate needs.
+    // Polls each node's head and re-injects to the ones not yet holding `want`.
+    let establish_head = |w: &B32, want: &B32, msg: &WireMessage| -> bool {
+        for _ in 0..30 {
+            let behind: Vec<&String> = nodes
+                .iter()
+                .filter(|a| !matches!(query(a, w), Some((_, head)) if head == want.as_slice()))
+                .collect();
+            if behind.is_empty() {
+                return true;
+            }
+            for a in &behind {
                 send_oneway(a, msg);
             }
             sleep(400);
@@ -323,13 +419,20 @@ fn main() {
                 hex16(&wid)
             );
         }
-        // Two S-authored conflicting successors at the SAME seq = a genuine double-spend.
-        let (a, b) = (id(0xA5, 0x01), id(0xB5, 0x01));
-        let (txa, txb) = (id(0x05, 0x01), id(0x06, 0x01));
-        let a_msg = seq_update(Some(&signer), &wid, &a, &txa, 10, seq, 3);
-        let b_msg = seq_update(Some(&signer), &wid, &b, &txb, 11, seq, 3);
-        // Establish A' mesh-wide (every node gets an SMT entry to flip), then inject B'.
-        establish(&wid, &a_msg);
+        // Two S-authored conflicting successors at the SAME seq, BOTH consuming
+        // the same parent X (KI#46 check-3: only a same-parent fork is provable).
+        // X is injected first so every node records previous_states[S] = X when it
+        // adopts A′; B′ then re-consumes X = the provable double-spend.
+        let (x, a, b) = (id(0xF5, 0x01), id(0xA5, 0x01), id(0xB5, 0x01));
+        let (txx, txa, txb) = (id(0x04, 0x01), id(0x05, 0x01), id(0x06, 0x01));
+        let x_msg = seq_update(Some(&signer), &wid, &x, &no_parent(), &txx, 9, seq.saturating_sub(1), 3);
+        let a_msg = seq_update(Some(&signer), &wid, &a, &x, &txa, 10, seq, 3);
+        let b_msg = seq_update(Some(&signer), &wid, &b, &x, &txb, 11, seq, 3);
+        // Establish base X, then A′ as the adopted head (records the parent), then B′.
+        establish(&wid, &x_msg);
+        if !establish_head(&wid, &a, &a_msg) {
+            println!("  [WARN] FUNDED: A' (parent X) not adopted everywhere — fork unprovable on stragglers");
+        }
         for addr in &nodes {
             send_oneway(addr, &b_msg);
         }
@@ -358,17 +461,29 @@ fn main() {
     if prop_mode {
         let wallet = Ed25519Signer::from_seed(&[0xCC; 32]);
         let w = id(0xDC, 0x09);
-        let (a, b) = (id(0xAC, 0x09), id(0xBC, 0x09));
-        let (txa, txb) = (id(0x0C, 0x09), id(0x0D, 0x09));
-        println!("[PROP] cross-node: inject double-spend to node[0] only; ban must FLOOD to all {} nodes", nodes.len());
-        let a_msg = seq_update(Some(&wallet), &w, &a, &txa, 10, 5, 3);
-        // establish A' on node[0] only (it is the detector); other nodes learn via gossip
+        let (x, a, b) = (id(0xFC, 0x09), id(0xAC, 0x09), id(0xBC, 0x09));
+        let (txx, txa, txb) = (id(0x0B, 0x09), id(0x0C, 0x09), id(0x0D, 0x09));
+        println!("[PROP] cross-node: inject 3-step double-spend to node[0] only; Banned status must reach all {} nodes", nodes.len());
+        // NOTE (KI#46 follow-up 2): SeqForkBan remote ADOPTION was removed as
+        // unsound (remote evidence lacks parent binding). node[0] detects the
+        // fork LOCALLY and flips its entry to Banned; the rest learn via the
+        // merge's Banned-rank monotonicity as that entry replicates — not by
+        // adopting packaged evidence. That is what this scenario now measures.
+        let x_msg = seq_update(Some(&wallet), &w, &x, &no_parent(), &txx, 9, 4, 3);
+        let a_msg = seq_update(Some(&wallet), &w, &a, &x, &txa, 10, 5, 3);
+        // establish base X then A' on node[0] only (it is the detector — it must
+        // hold previous_states[W]=X); other nodes learn via gossip.
         for _ in 0..30 {
             if query(&nodes[0], &w).is_some() { break; }
+            send_oneway(&nodes[0], &x_msg);
+            sleep(400);
+        }
+        for _ in 0..30 {
+            if matches!(query(&nodes[0], &w), Some((_, head)) if head == a.as_slice()) { break; }
             send_oneway(&nodes[0], &a_msg);
             sleep(400);
         }
-        let b_msg = seq_update(Some(&wallet), &w, &b, &txb, 11, 5, 3);
+        let b_msg = seq_update(Some(&wallet), &w, &b, &x, &txb, 11, 5, 3);
         send_oneway(&nodes[0], &b_msg);
         // assert BANNED on ALL nodes; reinject the conflict to node[0] only.
         let node0 = nodes[0].clone();
@@ -407,18 +522,26 @@ fn main() {
         return;
     }
 
-    // ── DS-POS — two authored k3 successors at the same seq → BANNED ───────────
+    // ── DS-POS — two authored k3 children of the SAME parent → BANNED ──────────
+    // The 3-step shape (KI#46 check-3): base X (seq 4) → A′ consumes X (seq 5,
+    // which records previous_states[W]=X on every node) → B′ ALSO consumes X at
+    // seq 5. Only now can a node PROVE the fork; the pre-rework parent-less pair
+    // correctly did not ban and the scenario was vacuous.
     {
         let wallet = Ed25519Signer::from_seed(&[0xC1; 32]);
         let w = id(0xD5, 0x01);
-        let (a, b) = (id(0xA1, 0x01), id(0xB1, 0x01));
-        let (txa, txb) = (id(0x0A, 0x01), id(0x0B, 0x01));
-        println!("[DS-POS] authored double-spend: A' then B' at the SAME seq=5 (both k=3, authored)");
-        let a_msg = seq_update(Some(&wallet), &w, &a, &txa, 10, 5, 3);
-        if !establish(&w, &a_msg) {
-            println!("  [WARN] DS-POS: A' not established on all nodes before conflict");
+        let (x, a, b) = (id(0xF1, 0x01), id(0xA1, 0x01), id(0xB1, 0x01));
+        let (txx, txa, txb) = (id(0x0F, 0x01), id(0x0A, 0x01), id(0x0B, 0x01));
+        println!("[DS-POS] 3-step authored double-spend: base X@seq=4 → A' consumes X @seq=5 → B' consumes X @seq=5");
+        let x_msg = seq_update(Some(&wallet), &w, &x, &no_parent(), &txx, 9, 4, 3);
+        if !establish(&w, &x_msg) {
+            println!("  [WARN] DS-POS: base X not established on all nodes");
         }
-        let b_msg = seq_update(Some(&wallet), &w, &b, &txb, 11, 5, 3);
+        let a_msg = seq_update(Some(&wallet), &w, &a, &x, &txa, 10, 5, 3);
+        if !establish_head(&w, &a, &a_msg) {
+            println!("  [WARN] DS-POS: A' (parent X) not adopted on all nodes — the fork may be unprovable there");
+        }
+        let b_msg = seq_update(Some(&wallet), &w, &b, &x, &txb, 11, 5, 3);
         for addr in &nodes {
             send_oneway(addr, &b_msg);
         }
@@ -426,36 +549,50 @@ fn main() {
     }
 
     // ── DS-FORGE — forged (unauthored) fork must NOT ban (anti-framing) ────────
+    // Post-KI#46 zero-pk flip this is refused EARLIER than the authorship gate
+    // it was written for: an unauthored StateUpdate is dropped outright (YPX-009
+    // enforced), so the wallet never even appears on the mesh.
     {
         let w = id(0xD5, 0x02);
-        let (a, b) = (id(0xA1, 0x02), id(0xB1, 0x02));
-        let (txa, txb) = (id(0x0A, 0x02), id(0x0B, 0x02));
-        println!("[DS-FORGE] framing attack: forged k=3 SeqProofs, client_pk=0 (unauthored) → must NOT ban");
-        let a_msg = seq_update(None, &w, &a, &txa, 10, 5, 3);
-        if !establish(&w, &a_msg) {
-            println!("  [WARN] DS-FORGE: A' not established on all nodes before conflict");
-        }
-        let b_msg = seq_update(None, &w, &b, &txb, 11, 5, 3);
-        for addr in &nodes {
-            send_oneway(addr, &b_msg);
+        let (x, a, b) = (id(0xF1, 0x02), id(0xA1, 0x02), id(0xB1, 0x02));
+        let (txx, txa, txb) = (id(0x0F, 0x02), id(0x0A, 0x02), id(0x0B, 0x02));
+        println!("[DS-FORGE] framing attack: forged k=3 SeqProofs, client_pk=0 (unauthored) → dropped, never banned");
+        for (state, tx, tick, seq, parent) in [
+            (x, txx, 9u64, 4u64, no_parent()),
+            (a, txa, 10, 5, x),
+            (b, txb, 11, 5, x),
+        ] {
+            let msg = seq_update(None, &w, &state, &parent, &tx, tick, seq, 3);
+            for addr in &nodes {
+                send_oneway(addr, &msg);
+            }
         }
         sleep(1500);
-        // Unauthored → the authorship gate refuses the ban; head stays NORMAL.
-        assert_all("DS-FORGE", &w, "NORMAL", None, &mut failures);
+        // Zero-pk is rejected at the top of apply_state_update → NO entry exists.
+        let present: Vec<&String> = nodes.iter().filter(|a| query(a, &w).is_some()).collect();
+        if present.is_empty() {
+            println!("  [PASS] DS-FORGE: unauthored fork rejected on all {} nodes (no entry, no ban)", nodes.len());
+        } else {
+            println!("  [FAIL] DS-FORGE: unauthored update was STORED on: {}", present.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+            failures += 1;
+        }
     }
 
     // ── DS-ADV — authored sequential advance (different seq) must NOT ban ──────
     {
         let wallet = Ed25519Signer::from_seed(&[0xC3; 32]);
         let w = id(0xD5, 0x03);
-        let (a, b) = (id(0xA1, 0x03), id(0xB1, 0x03));
-        let (txa, txb) = (id(0x0A, 0x03), id(0x0B, 0x03));
-        println!("[DS-ADV] authored sequential advance: A'@seq=5 then B'@seq=6 → NOT a conflict");
-        let a_msg = seq_update(Some(&wallet), &w, &a, &txa, 10, 5, 3);
-        if !establish(&w, &a_msg) {
-            println!("  [WARN] DS-ADV: A' not established on all nodes before advance");
+        let (x, a, b) = (id(0xF1, 0x03), id(0xA1, 0x03), id(0xB1, 0x03));
+        let (txx, txa, txb) = (id(0x0F, 0x03), id(0x0A, 0x03), id(0x0B, 0x03));
+        println!("[DS-ADV] authored sequential advance: A'@seq=5 (parent X) then B'@seq=6 (parent A') → NOT a conflict");
+        let x_msg = seq_update(Some(&wallet), &w, &x, &no_parent(), &txx, 9, 4, 3);
+        establish(&w, &x_msg);
+        let a_msg = seq_update(Some(&wallet), &w, &a, &x, &txa, 10, 5, 3);
+        if !establish_head(&w, &a, &a_msg) {
+            println!("  [WARN] DS-ADV: A' not adopted on all nodes before advance");
         }
-        let b_msg = seq_update(Some(&wallet), &w, &b, &txb, 11, 6, 3);
+        // A genuine next tx: chain continuation off A' at a HIGHER seq.
+        let b_msg = seq_update(Some(&wallet), &w, &b, &a, &txb, 11, 6, 3);
         for addr in &nodes {
             send_oneway(addr, &b_msg);
         }
@@ -463,19 +600,47 @@ fn main() {
         assert_all("DS-ADV", &w, "NORMAL", None, &mut failures);
     }
 
+    // ── DS-CONT — same-seq CHAIN CONTINUATION (a redeem) must NOT ban ─────────
+    // The live counterpart of `dsfork_same_seq_chain_continuation_redeem_NO_ban`
+    // — the shape that false-banned honest wallet A in gate run 1785338039.
+    // Core keeps wallet_seq unchanged on receive, so a redeem is a same-seq
+    // advance whose parent is the HELD HEAD (not the head's parent).
+    {
+        let wallet = Ed25519Signer::from_seed(&[0xC5; 32]);
+        let w = id(0xD5, 0x05);
+        let (x, a, b) = (id(0xF1, 0x05), id(0xA1, 0x05), id(0xB1, 0x05));
+        let (txx, txa, txb) = (id(0x0F, 0x05), id(0x0A, 0x05), id(0x0B, 0x05));
+        println!("[DS-CONT] same-seq chain continuation (redeem): A'@seq=5 parent X, then B'@seq=5 parent A' → NOT a fork");
+        let x_msg = seq_update(Some(&wallet), &w, &x, &no_parent(), &txx, 9, 4, 3);
+        establish(&w, &x_msg);
+        let a_msg = seq_update(Some(&wallet), &w, &a, &x, &txa, 10, 5, 3);
+        if !establish_head(&w, &a, &a_msg) {
+            println!("  [WARN] DS-CONT: A' not adopted on all nodes before the continuation");
+        }
+        // Parent = A' (the held head) at the SAME seq: legitimate receive advance.
+        let b_msg = seq_update(Some(&wallet), &w, &b, &a, &txb, 11, 5, 3);
+        for addr in &nodes {
+            send_oneway(addr, &b_msg);
+        }
+        sleep(1500);
+        assert_all("DS-CONT", &w, "NORMAL", None, &mut failures);
+    }
+
     // ── DS-SUBQ — authored conflict but sub-quorum (k=2) must NOT ban ──────────
     {
         let wallet = Ed25519Signer::from_seed(&[0xC4; 32]);
         let w = id(0xD5, 0x04);
-        let (a, b) = (id(0xA1, 0x04), id(0xB1, 0x04));
-        let (txa, txb) = (id(0x0A, 0x04), id(0x0B, 0x04));
-        println!("[DS-SUBQ] authored conflict at seq=5 but only k=2 sigs → sub-quorum, NOT banned");
-        let a_msg = seq_update(Some(&wallet), &w, &a, &txa, 10, 5, 3);
-        if !establish(&w, &a_msg) {
-            println!("  [WARN] DS-SUBQ: A' not established on all nodes before conflict");
+        let (x, a, b) = (id(0xF1, 0x04), id(0xA1, 0x04), id(0xB1, 0x04));
+        let (txx, txa, txb) = (id(0x0F, 0x04), id(0x0A, 0x04), id(0x0B, 0x04));
+        println!("[DS-SUBQ] same-parent conflict at seq=5 but only k=2 sigs → sub-quorum, NOT banned");
+        let x_msg = seq_update(Some(&wallet), &w, &x, &no_parent(), &txx, 9, 4, 3);
+        establish(&w, &x_msg);
+        let a_msg = seq_update(Some(&wallet), &w, &a, &x, &txa, 10, 5, 3);
+        if !establish_head(&w, &a, &a_msg) {
+            println!("  [WARN] DS-SUBQ: A' not adopted on all nodes before conflict");
         }
-        // conflicting state at the same seq, but only 2 sigs
-        let b_msg = seq_update(Some(&wallet), &w, &b, &txb, 11, 5, 2);
+        // Same parent X, same seq — but only 2 sigs, so the fork is unprovable.
+        let b_msg = seq_update(Some(&wallet), &w, &b, &x, &txb, 11, 5, 2);
         for addr in &nodes {
             send_oneway(addr, &b_msg);
         }

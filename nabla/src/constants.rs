@@ -17,8 +17,102 @@ mod tuning_gen;
 
 // TARDIS tick
 pub const TICK_INTERVAL_SECS: u64 = tuning_gen::TICK_INTERVAL_SECS;
+
+/// KI#71 — §5.5 audit challenge lifetime before a re-issue may overwrite it.
+/// Tick COUNT (KI#47); compare against a tick VALUE only via `ticks_to_secs`.
+pub const AUDIT_CHALLENGE_PENDING_TICKS: u64 = tuning_gen::AUDIT_CHALLENGE_PENDING_TICKS;
+/// KI#71 — cap on queued AuditRequests that are not from a current downstream.
+pub const AUDIT_INBOX_OTHER_CAP: usize = tuning_gen::AUDIT_INBOX_OTHER_CAP as usize;
+
+/// KI#63 §3.3 — window for the AE stall alarm. Tick COUNT (KI#47).
+pub const AE_STALL_ALARM_INTERVAL_TICKS: u64 = tuning_gen::AE_STALL_ALARM_INTERVAL_TICKS;
+/// Rejections needed in a window before "applied nothing" is evidence.
+pub const AE_STALL_ALARM_MIN_REJECTS: u64 = tuning_gen::AE_STALL_ALARM_MIN_REJECTS;
+/// Fork detections needed before "applied nothing" is a STALL not CONVERGENCE.
+pub const AE_STALL_ALARM_MIN_FORKS: u64 = tuning_gen::AE_STALL_ALARM_MIN_FORKS;
+
+/// KI#42 bloom-era sizing — expected REAL items per 90-day era, per chain.
+/// See `protocol_nabla.toml` for the error-rate table, the placeholder warning
+/// (these are not measured throughputs), and why they may only change at a
+/// coordinated release boundary.
+pub const CONSUMED_ERA_REAL_ITEMS: u64 = tuning_gen::CONSUMED_ERA_REAL_ITEMS;
+pub const TXID_ERA_REAL_ITEMS: u64 = tuning_gen::TXID_ERA_REAL_ITEMS;
+/// KI#43b — total recording (hashmap) nodes deployed; the adjudication
+/// barrier needs answers from ALL `TOTAL - 1` peers before acquitting.
+pub const RECORDING_NODES_TOTAL: usize = tuning_gen::RECORDING_NODES_TOTAL as usize;
 pub const TICK_SLOT_PIGGYBACK_MAX: usize = tuning_gen::TICK_SLOT_PIGGYBACK_MAX as usize;
+
+/// Fork Settlement §9o [R58/R59] — R48 record-AE bounds (`record_sync.rs`);
+/// see `protocol_nabla.toml` for each register's meaning. `RECORD_AE_BUCKET_SPLIT`
+/// is part of the record trie's HASH: one value per mesh.
+pub const RECORD_AE_BUCKET_SPLIT: usize = tuning_gen::RECORD_AE_BUCKET_SPLIT as usize;
+pub const RECORD_AE_MAX_PREFIXES_PER_ASK: usize = tuning_gen::RECORD_AE_MAX_PREFIXES_PER_ASK as usize;
+pub const RECORD_AE_MAX_LEGS_PER_ANSWER: usize = tuning_gen::RECORD_AE_MAX_LEGS_PER_ANSWER as usize;
+pub const RECORD_AE_MAX_ANSWER_BYTES: u64 = tuning_gen::RECORD_AE_MAX_ANSWER_BYTES;
+pub const RECORD_AE_ASKS_PER_FROM_PER_WINDOW: u32 = tuning_gen::RECORD_AE_ASKS_PER_FROM_PER_WINDOW as u32;
+pub const RECORD_AE_ANSWERS_PER_WINDOW: u64 = tuning_gen::RECORD_AE_ANSWERS_PER_WINDOW;
+/// Wall-clock seconds (`virtual_secs`), not ticks.
+pub const RECORD_AE_WINDOW_SECS: u64 = tuning_gen::RECORD_AE_WINDOW_SECS;
+/// Wall-clock seconds (`virtual_secs`), not ticks.
+pub const RECORD_AE_REPLY_TTL_SECS: u64 = tuning_gen::RECORD_AE_REPLY_TTL_SECS;
+
+/// FOB (Bounded Pools) — the tranche EPOCH length + mover substitution grace,
+/// as TARDIS tick COUNTs (KI#47). Infrastructure/carrier timing (Nabla owns the
+/// clock); the tranche ECONOMICS + §5 eligibility floor are Core-owned
+/// (`protocol_core.toml`). See `docs/AXIOM_DESIGN_BoundedPools.md` §6.
+pub const FOB_TRANCHE_EPOCH_DURATION_TICKS: u64 = tuning_gen::FOB_TRANCHE_EPOCH_DURATION_TICKS;
+pub const FOB_SUBSTITUTION_GRACE_TICKS: u64 = tuning_gen::FOB_SUBSTITUTION_GRACE_TICKS;
+/// The DEV-FUND tranche epoch (§10.2a) — short in BOTH builds so `@axiom.internal`
+/// funds tranche continually for testing while the real fund waits the week.
+pub const FOB_DEV_FUND_EPOCH_TICKS: u64 = tuning_gen::FOB_DEV_FUND_EPOCH_TICKS;
+
+/// The FOB epoch length for a pool's class (§10.2a): the ONE codepath picks the
+/// dev-fund cadence or the real cadence purely by this data bit — no fork.
+pub const fn fob_epoch_ticks(is_dev: bool) -> u64 {
+    if is_dev {
+        FOB_DEV_FUND_EPOCH_TICKS
+    } else {
+        FOB_TRANCHE_EPOCH_DURATION_TICKS
+    }
+}
+
+/// KI#165 (fixed 2026-09-25): the FOB epoch length as a **tick-VALUE span** (unix
+/// seconds) — the ONE projection of the tick-COUNT register above, exactly as
+/// `emission::epoch_span_secs` does for the emission epoch. `fob::epoch_id` divides a
+/// TARDIS tick VALUE (unix secs, KI#47), so its divisor must be in the same unit; the
+/// three call sites used the raw COUNT and made the real epoch 150,000 s (1.74 d)
+/// instead of the ~8.7 d the register promises. Never divide or multiply a tick
+/// VALUE by `fob_epoch_ticks` directly — use this.
+pub const fn fob_epoch_span_secs(is_dev: bool) -> u64 {
+    axiom_core_logic::types::ticks_to_secs(fob_epoch_ticks(is_dev))
+}
 pub const PARENTLESS_TIMEOUT_TICKS: u64 = tuning_gen::PARENTLESS_TIMEOUT_TICKS;
+
+/// Contribution emission claim caps (`AXIOM_DESIGN_ValidatorEmission.md` §7):
+/// the airdrop cycle's two layers, on the emission pools, per FOB epoch.
+pub const EMISSION_CLAIMS_MESH_CAP_PER_EPOCH: u64 = tuning_gen::EMISSION_CLAIMS_MESH_CAP_PER_EPOCH;
+pub const EMISSION_CLAIMS_PER_EPOCH_PER_NABLA: u64 = tuning_gen::EMISSION_CLAIMS_PER_EPOCH_PER_NABLA;
+
+/// Orphan recovery pass 0 (strict, dc=1-only) lasts this many orphan ticks;
+/// afterwards the node relaxes and accepts any open D slot (YPX-003 §2.6).
+/// Without the relaxed pass an orphan can deadlock permanently — see the
+/// register comment.
+pub const ORPHAN_STRICT_PASS_TICKS: u64 = tuning_gen::ORPHAN_STRICT_PASS_TICKS;
+/// KI#79 — consecutive unarmed bootstrap-pull rounds before the node
+/// escalates its unarmed logging from info! to warn!. See
+/// protocol_nabla.toml for the rationale.
+pub const UNARMED_ESCALATION_ROUNDS: u64 = tuning_gen::UNARMED_ESCALATION_ROUNDS;
+
+/// Grace, in ticks, before a child starts counting grandpa-tick misses against
+/// a NEWLY attached parent (KI#48). Breaks the circular condition where a child
+/// leaves any parent that is not already a writer, while a parent becomes a
+/// writer only by keeping two children.
+pub const GRANDPA_SETTLE_TICKS: u32 = tuning_gen::GRANDPA_SETTLE_TICKS as u32;
+
+/// Consecutive grandpa-tick misses before detaching. Register-sourced since
+/// 2026-08-01 (was hardcoded in tardis.rs).
+pub const GRANDPA_MISS_DETACH_THRESHOLD: u32 =
+    tuning_gen::GRANDPA_MISS_DETACH_THRESHOLD as u32;
 
 // Writer check
 pub const WRITER_GRACE_TICKS: u8 = tuning_gen::WRITER_GRACE_TICKS as u8;
@@ -129,12 +223,25 @@ pub const LATENCY_PENALTY_MAX: f32 = 4.0;
 // Anti-entropy
 pub const ANTI_ENTROPY_INTERVAL: u64 = 6;
 
-// §32 Merge Protocol
-/// Quarantine duration in seconds: 3 × MATURITY_WINDOW (25s) = 75 seconds.
-/// During quarantine, forked/tainted wallets are FROZEN.
-pub const MERGE_QUARANTINE_SECS: u64 = 75;
-/// Quarantine duration in ticks (75s / 5s per tick = 15 ticks).
-pub const MERGE_QUARANTINE_TICKS: u64 = MERGE_QUARANTINE_SECS / 5;
+/// KI#82 — fee-ledger (`txid_records`) anti-entropy bucket width, in ticks. The
+/// §19.6 fee ledger has no AE backstop (gossip-only), so recorders diverge under
+/// load. AE partitions records by `tick / TXID_AE_BUCKET_TICKS`: because the
+/// ledger is append-only, old buckets' digests are frozen and only the recent
+/// bucket churns, so only divergent buckets ever transfer records. Coarse enough
+/// that the digest vector stays small, fine enough that a divergent bucket is a
+/// bounded transfer. ~5 min at 1 tick/s. See AXIOM_DESIGN_NablaAntiEntropy.md §13.
+pub const TXID_AE_BUCKET_TICKS: u64 = 300;
+
+// (§32 Merge Protocol: `MERGE_QUARANTINE_SECS` / `MERGE_QUARANTINE_TICKS` —
+// the 75 s quarantine — deleted 2026-10-02 with the timer, ForkSettlement
+// §9r-E4 / D-E4-1. The `merge_quarantine_ticks` register is gone too.)
+
+/// Bloom-era duration. KI#47: this is an EVENT count while `maybe_rotate`
+/// divides a tick-VALUE span by it, so the effective era is 1/5th of the
+/// stated 90 days. Value moved to protocol_nabla.toml UNCHANGED; correcting
+/// it is KI#47 (type as TickCount so rustc finds every mixing site).
+pub const DEFAULT_ERA_DURATION_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(tuning_gen::DEFAULT_ERA_DURATION_TICKS);
 
 // DEED and Runner Reward — keep in sync with protocol_core.toml [deed]
 pub const DEED_WRITE_FEE: u64 = 1_000;
@@ -142,13 +249,32 @@ pub const DEED_READ_FEE: u64 = 100;
 pub const DEED_RUNNER_POOL_PCT: u8 = 30;
 pub const DEED_RUNNER_POOL_FINAL_PCT: u8 = 100;
 pub const DEED_TRANSITION_TICKS: u64 = 10 * 365 * 24 * 720;
+/// KI#53 — receipt freshness on `/register`. Was a bare literal `300` inline in
+/// registration.rs with no name and no unit. See `protocol_nabla.toml` for the
+/// two caveats that matter: the check is INERT today (`receipt.tick` is always
+/// 0), and if switched on it must exceed the supplemental queue's 1-hour retry
+/// horizon or it will reject legitimate re-registrations.
+pub const RECEIPT_STALENESS_MAX_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(tuning_gen::RECEIPT_STALENESS_MAX_TICKS);
+
 pub const RUNNER_CLAIM_INTERVAL_SECS: u64 = 86_400;
-pub const RUNNER_CLAIM_TICKS: u64 = 86_400 / 5;
+pub const RUNNER_CLAIM_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(tuning_gen::RUNNER_CLAIM_TICKS);
 
 // NBC (Nabla Birth Certificate) — Section 7.8
 // NBC = VBC from Core (YPX-002: "same VBC function with role = nabla").
 // These constants are for sim use only. In production, Core sets all NBC/VBC fields.
 pub const NBC_EXPIRY_SECS: u64 = 30 * 86_400; // 30 days (sim default)
+/// DEV-ONLY (design decision 2026-08-10) — the fixed OODS baseline a dev mesh substitutes
+/// when its genesis NBC carries baseline 0 (YPX-021 §7 exempt). Genesis
+/// baseline 0 fails `fob_mover_eligible` closed forever, so a dev mesh could
+/// never author a FOB tranche to validate the path; stamping the 10-node dev
+/// mesh's size makes eligibility match a healthy production mesh. Used ONLY by
+/// `build_oods_attestation(for_fob=true)` when core/logic is built `dev-mode`
+/// (`version::TUNING_PROFILE == "dev"` — KI#240; it was this crate's feature);
+/// RELEASE stamps the real NBC-bound baseline and `verify_oods_attestation`
+/// compares it properly. NEVER a production value.
+pub const DEV_OODS_BASELINE: u32 = 10;
 pub const NBC_RENEWAL_WINDOW_SECS: u64 = 7 * 86_400; // renew in last 7 days (sim default)
 /// Transaction budget per NBC (Yellow Paper §25.2 "NBC TX Budget", VBC/NBC `max_tx` field).
 /// Peers track registrations processed by a node and reject once past this limit.
@@ -184,11 +310,42 @@ pub const BOOTSTRAP_PEERS_MAX: usize = 128;
 /// Genesis Nabla node base port (test/dev). Genesis node i listens on GENESIS_BASE_PORT + i.
 pub const GENESIS_BASE_PORT: u16 = 6225;
 
-/// Probation period for new (non-genesis) Nabla nodes (48 hours in seconds).
-/// During probation, node stays LEAF — no WRITER promotion allowed.
-/// Network uses this window to detect duplicate Nabla_id via gossip.
-/// Uses TARDIS tick time (virtual), NEVER SystemTime::now().
-pub const NABLA_PROBATION_SECS: u64 = 48 * 3600;
+/// GUIDE §5.6c (KI#75, ruled 2026-09-25) — join probation window as a TARDIS
+/// tick COUNT (KI#47): a citizen NBC younger than this is probationary on
+/// every node that reads it. `_dev` twin selected by the `dev-mode` feature
+/// (build.rs pair convention). The ONE predicate is `cc::is_probationary`;
+/// never compare this count to a tick VALUE directly — use
+/// `nabla_probation_span_secs`.
+///
+/// Replaces `NABLA_PROBATION_SECS = 48 * 3600` (a .rs const the tuning rule
+/// forbids), whose only readers were `#[cfg(test)]` from 2026-03-26 until
+/// this ruling.
+pub const NABLA_PROBATION_TICKS: u64 = tuning_gen::NABLA_PROBATION_TICKS;
+
+/// The probation window as a **tick-VALUE span** (unix seconds) — the ONE
+/// projection of the count above, exactly as `fob_epoch_span_secs` does for
+/// the FOB epoch. `issued_at` is a unix-second stamp, so the age it is compared
+/// against must be in the same unit (KI#40/#165 class).
+pub const fn nabla_probation_span_secs() -> u64 {
+    axiom_core_logic::types::ticks_to_secs(NABLA_PROBATION_TICKS)
+}
+
+/// YPX-002 §9.1.1a (RULED 2026-09-25) — NBC issuer self-cap: the most
+/// `NbcIssuanceRequest`s one issuer SIGNS within one FOB epoch
+/// (`fob_epoch_span_secs(false)`, the mesh's epoch clock). A COUNT, not a
+/// time unit. `_dev` twin selected by the `dev-mode` feature. Enforced by
+/// `cc::NbcIssuanceBudget` on the issuer (refusal `ISSUER_CAP_REACHED`,
+/// persisted in the snapshot) and observed by every peer
+/// (`[NBC-ISSUER-OVER-CAP]`, never a refusal). Genesis (chain_depth 0) exempt.
+pub const NBC_ISSUANCE_MAX_PER_EPOCH: u64 = tuning_gen::NBC_ISSUANCE_MAX_PER_EPOCH;
+
+/// The FOB epoch id an NBC `issued_at` stamp (unix seconds, a tick VALUE)
+/// falls in — the ONE projection both the issuer's budget and the peer alarm
+/// use (KI#165 style: VALUE ÷ VALUE-span, never ÷ the raw tick COUNT).
+pub const fn nbc_issuance_epoch(issued_at: u64) -> u64 {
+    let span = fob_epoch_span_secs(false);
+    issued_at / if span == 0 { 1 } else { span }
+}
 
 pub const IPV6_RECOMMENDED: bool = true;
 
@@ -255,11 +412,30 @@ pub const POOL_SYNC_MAX_CLAIMS_SKEW_PER_MERGE: u64 =
 /// Airdrop pool initial balance in atoms. The AXC magnitude is the tunable register
 /// (protocol_nabla.toml `airdrop_pool_initial_axc`); atoms are DERIVED via axc() so
 /// they can never drift from ATOMS_PER_AXC. Compile-time const (no runtime conversion).
-pub const AIRDROP_POOL_INITIAL_ATOMS: u64 = axiom_denomination::axc(tuning_gen::AIRDROP_POOL_INITIAL_AXC);
+pub const AIRDROP_POOL_INITIAL_ATOMS: u64 =
+    axiom_denomination::axc(axiom_core_logic::types::POOL_AIRDROP_AXC);
 /// Dev treasury pool initial balance — 1,000,000 dev-AXC (FACT class isolation §4).
 /// AXC magnitude from protocol_nabla.toml `dev_treasury_pool_initial_axc`; atoms derived.
 /// Single source for every `DevTreasuryPool::new()` site.
-pub const DEV_TREASURY_POOL_INITIAL_ATOMS: u64 = axiom_denomination::axc(tuning_gen::DEV_TREASURY_POOL_INITIAL_AXC);
+pub const DEV_TREASURY_POOL_INITIAL_ATOMS: u64 =
+    axiom_denomination::axc(axiom_core_logic::types::POOL_DEV_TREASURY_AXC);
+
+/// Tier-3 (Community) validator-join subsidy — 400 slots x the tier-3 CLAIM.
+///
+/// ⚠ READ FROM THE GENESIS DISTRIBUTION TABLE, NOT FROM protocol_nabla.toml
+/// (2026-09-04). This number had three homes — Nabla's TOML, the FACT #0
+/// declaration, and the Rust tier constants — and a test in each of two crates
+/// policing the equality. When the claim payout changed, one home was missed:
+/// Nabla matched a claim at 505 AXC while debiting the pool 500, i.e. Core
+/// minting supply the pool never paid. It is now DERIVED once, in
+/// core/logic/protocol_core.toml, where `build.rs` refuses to compile a
+/// distribution that does not add up to the declared 100,000,000 supply.
+pub const BOOTSTRAP_POOL_INITIAL_ATOMS: u64 =
+    axiom_denomination::axc(axiom_core_logic::types::POOL_BOOTSTRAP_AXC);
+/// Tier-2 (Foundation) validator-join subsidy — 5 slots x the tier-2 CLAIM.
+/// Same single source as the Community pool above.
+pub const FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS: u64 =
+    axiom_denomination::axc(axiom_core_logic::types::POOL_FOUNDATION_BOOTSTRAP_AXC);
 
 pub const DEV_TREASURY_CYCLE_TICKS: u64 = 9999;
 pub const DEV_TREASURY_CYCLE_SECS: u64 = DEV_TREASURY_CYCLE_TICKS * TICK_INTERVAL_SECS;
@@ -326,9 +502,14 @@ pub const QUARANTINE_REACTIVATION_COOLDOWN_TICKS: u64 = 10;
 /// negligible bandwidth saving of the 30 s cadence.
 pub const POOL_SYNC_HEARTBEAT_TICKS: u64 = 1;
 
-// Oracle Distribution (YPX-012, Market Allocation from White Paper §2.10)
-pub const TOTAL_RESERVE_AXC: u64 = 88_000_000;
-pub const DAILY_EMISSION_AXC: u64 = 24_109;
+// Oracle Distribution (YPX-012). The OPEN share of the Market Allocation
+// category = the Market sub-pool register (`pool_market_axc`,
+// protocol_core.toml). DERIVED from Core, never typed (KI#164): until
+// 2026-09-14 these were hand-copied literals (85,500,000 / 23,424) that both
+// 2026-09 re-cuts missed. The sub-pool is also the source of the ruled
+// validator service emission (YP §25.2.4), which shares it.
+pub const TOTAL_RESERVE_AXC: u64 = axiom_core_logic::oracle::TOTAL_RESERVE;
+pub const DAILY_EMISSION_AXC: u64 = axiom_core_logic::oracle::DAILY_EMISSION;
 pub const PLATFORM_COUNT: usize = 11;
 pub const MIN_CLAIM_INTERVAL_SECS: u64 = 86_400;
 pub const MAX_CLAIMS_PER_USER_PER_DAY: usize = 11;
@@ -350,8 +531,23 @@ pub const WAL_PEER_VERIFY_SECTION_SIZE: u64 = 50;
 pub const WAL_REPAIR_MAX_RETRIES: u32 = 3;
 
 // State Sync (YPX-009 §12.8)
-/// Maximum bytes per StatePull response chunk.
-pub const STATE_PULL_MAX_BYTES: usize = 5_242_880;
+/// Maximum bytes per StatePull response SECTION (entries / bloom_eras /
+/// consumed_eras each budget against this independently).
+///
+/// KI#79 ROOT-CAUSE CONSTRAINT — this MUST fit at least ONE serialized bloom
+/// era, or era transfer starves SILENTLY and a node whose local chain lags
+/// the manifest can never re-arm (delta's 8-hour UNARMED livelock, gamma's
+/// 2026-08-08 reproduction). A fully-allocated era is
+/// `*_ERA_REAL_ITEMS (2.25M) × 4/3 × 14.4 bits ≈ 5.41 MiB` — allocated up
+/// front, so every era is that size regardless of fill. 6 MiB admits exactly
+/// one era per section per pull: monotonic, atomic, whole-era progress
+/// (chunking was deliberately REJECTED — chunks cannot be mixed across peers,
+/// because two peers' filters for the same era are different byte strings).
+/// ENFORCED at boot (nabla_node panics if an era outgrows the caps) and by
+/// `ki79_era_fits_transfer_caps`. If you raise `*_ERA_REAL_ITEMS`, raise
+/// this and `WIRE_MAX_MSG_BYTES` in the same commit — the guard will not let
+/// you forget.
+pub const STATE_PULL_MAX_BYTES: usize = 6_291_456;
 /// Timeout for StatePull requests (seconds).
 pub const STATE_PULL_TIMEOUT_SECS: u64 = 30;
 /// Cooldown between StatePull requests to same peer (seconds).
@@ -366,8 +562,9 @@ pub const RANGE_SYNC_TIMEOUT_SECS: u64 = 30;
 pub const STATE_PULL_MAX_CONCURRENT_SERVE: usize = 3;
 
 // Silicon Pulse Gossip (YPX-009 §5)
-/// Domain tag for pulse proof Ed25519 signatures.
-pub const PULSE_PROOF_DOMAIN: &[u8] = b"AXIOM_PULSE_PROOF";
+// (`PULSE_PROOF_DOMAIN` DELETED 2026-10-02 — KI#55 leftover: an unread second
+// copy of the `AXIOM_PULSE_PROOF` tag; Core's `pulse::pulse_proof_sign_payload`
+// is the ONE builder.)
 /// How often (in ticks) Nabla evaluates pulse delivery for peer scoring.
 /// Matches PULSE_EPOCH_LENGTH_TICKS (720 ticks = 1 hour).
 pub const PULSE_EVAL_INTERVAL_TICKS: u64 = 720;

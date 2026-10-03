@@ -76,18 +76,24 @@ fn query_head(addr: &str, wallet: &B32) -> Option<Vec<u8>> {
     }
 }
 
-/// Pull the WI1 recovery payload (consumed_bloom + previous_states) from a node.
-fn state_pull_bootstrap(addr: &str) -> Option<(Vec<u8>, Vec<(B32, B32)>)> {
+/// Pull the WI1 recovery payload (consumed eras + previous_states) from a node.
+/// KI#42 step 4d: the anti-rollback view travels as consumed-state ERAS now.
+/// `from: None` — this tool is an external client that reads the reply on its
+/// own connection (the send_reply path), not a mesh node.
+fn state_pull_bootstrap(addr: &str) -> Option<(Vec<Vec<u8>>, Vec<(B32, B32)>)> {
     let req = WireMessage::StatePullRequest {
         mode: StatePullMode::Bootstrap,
+        from: None,
         our_root_hash: [0u8; 32],
         from_tick: 0,
         to_tick: u64::MAX,
         section_hash: None,
+        have_era_ids: Vec::new(),
+        have_consumed_era_ids: Vec::new(),
     };
     match request(addr, &req)? {
-        WireMessage::StatePullResponse { consumed_bloom, previous_states, .. } => {
-            Some((consumed_bloom, previous_states))
+        WireMessage::StatePullResponse { consumed_eras, previous_states, .. } => {
+            Some((consumed_eras, previous_states))
         }
         _ => None,
     }
@@ -95,6 +101,8 @@ fn state_pull_bootstrap(addr: &str) -> Option<(Vec<u8>, Vec<(B32, B32)>)> {
 
 fn state_update(w: &B32, new: &B32, tx: &B32, tick: u64, seq: u64) -> WireMessage {
     WireMessage::Gossip(GossipMessage::StateUpdate {
+        old_state: [0u8; 32],
+        is_genesis_claim: false,
         wallet_id: *w,
         new_state: *new,
         tx_hash: *tx,
@@ -167,12 +175,12 @@ fn main() {
     println!("  -> {base_y}/{n} nodes hold head Y\n");
 
     // ── Part 1: the live StatePull bootstrap SERVES the WI1 re-arm payload. ──
-    println!("[recover] StatePull Bootstrap → must carry consumed_bloom + previous_states[w]=X");
+    println!("[recover] StatePull Bootstrap → must carry consumed era(s) + previous_states[w]=X");
     let mut served = 0u32;
     for addr in &nodes {
-        if let Some((bloom, prev)) = state_pull_bootstrap(addr) {
+        if let Some((eras, prev)) = state_pull_bootstrap(addr) {
             let has_prev_x = prev.iter().any(|(wid, st)| wid == &w && st == &x);
-            if !bloom.is_empty() && has_prev_x {
+            if !eras.is_empty() && has_prev_x {
                 served += 1;
             }
         }

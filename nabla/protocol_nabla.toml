@@ -32,13 +32,82 @@ CHILD_ROTATION_JITTER_TICKS    = 400      # test  ~33 min
 # CHILD_ROTATION_JITTER_TICKS = 14400     # prod  ~20h
 
 # ── TARDIS recovery / stability ────────────────────────────────────────────
-WRITER_SETTLE_TICKS      = 50   # grace before writer-check accrues on a new parent
+# ⚠ UNUSED as of 2026-08-01. Declared here and re-exported in constants.rs, but
+#   consumed by NOTHING in nabla/. Its comment also claimed
+#   ">= PARENT_ROTATION_INTERVAL", which is false (50 vs 2000). So the anti-bounce
+#   protection it advertised has never actually run. Kept (not deleted) because
+#   the writer-check may want its own settle later — but do NOT assume it guards
+#   anything today. The grandpa path's settle is GRANDPA_SETTLE_TICKS below.
+WRITER_SETTLE_TICKS      = 50   # UNUSED — see note above
                                 #   (>= PARENT_ROTATION_INTERVAL; avoids dc=1 bounce loops)
 WRITER_GRACE_TICKS       = 100  # consecutive non-writer ticks before a child detaches
                                 #   (~8 min; bumped from 3 at KI#18 to stop tree thrash)
 REBALANCE_COOLDOWN_TICKS = 10   # cooldown between voluntary rebalance moves
 D_RESERVATION_TICKS      = 10   # hold a D slot this long after a child goes offline
 PARENTLESS_TIMEOUT_TICKS = 5    # a node with children but no parent must reconnect within this
+
+# §5.5 bottom-up audit (KI#71 option A, 2026-10-01). An upstream now answers an
+# AuditRequest at its NEXT root-advertisement instant (the same SMT borrow that
+# samples the root it signs for that tick), so an answer arrives up to ~1 tick
+# after the challenge. The auditor keeps its pending (prefix, challenge_tick) for
+# this many ticks before a re-issue may overwrite it — shorter and every delayed
+# honest answer reads `unmatched` (the audit becomes a ghost). Tick COUNT (KI#47).
+AUDIT_CHALLENGE_PENDING_TICKS = 2
+# Queued AuditRequests from requesters that are NOT a current downstream (or not
+# the 8-bit challenge shape) are bounded by this cap; overflow is counted
+# (`audit_requests_shed` on /status). Requests from our own D1/D2/P children in
+# the 8-bit shape are never shed (dedup bounds them at 256 per child).
+AUDIT_INBOX_OTHER_CAP = 64
+
+# Orphan recovery is TWO-PASS (YPX-003 §2.15.2 'Recovery Placement Fix'). Pass 0 insists on a dc=1 parent
+# (filling it creates a writer); after this many orphan ticks the node RELAXES
+# and accepts any open D slot, because the spec's rule is "never stay orphan".
+#
+# Sized deliberately short. The failure this exists to prevent is a deadlock,
+# not a slow attach: if every dc=1 node in the mesh is itself orphaned, a
+# strict-only orphan can NEVER attach — it picks a parent with no upstream, gets
+# no grandpa tick, detaches on GRANDPA_MISS_DETACH_THRESHOLD, and repeats
+# forever. Observed 2026-08-01 with 8/10 nodes orphaned. Waiting a couple of
+# rotations before relaxing costs a little writer-preference; not relaxing at
+# all costs the whole mesh.
+ORPHAN_STRICT_PASS_TICKS = 6    # test  ~30s at 5s/tick before relaxing
+# ORPHAN_STRICT_PASS_TICKS = 12 # prod  ~60s
+
+# ── Serve-gate arming visibility (KI#79) ───────────────────────────────────
+#  delta sat UNARMED for 8 HOURS (2026-08-07) emitting an info!-level line
+#  every ~5s with no counter — the same log shape as a healthy 2-minute
+#  re-arm. Past this many CONSECUTIVE unarmed bootstrap-pull rounds the node
+#  escalates to warn! (naming the missing era IDs). A normal restart re-arms
+#  in ~24 rounds (~2 min at 5s/tick), so 60 (~5 min) is clearly pathological.
+#  Same value for test and prod: the bound is a round COUNT, and the round
+#  cadence (one per tick-loop iteration) is the same in both.
+UNARMED_ESCALATION_ROUNDS = 60
+
+
+# ── Grandpa-tick settle (KI#48 — the dc=1 bounce loop) ─────────────────────
+#  A child detaches from a parent that is not ALREADY a writer
+#  (`parent_is_writer = downstream_approvals >= 2`). But a parent BECOMES a
+#  writer only by holding two children — each of which leaves after
+#  GRANDPA_MISS_DETACH_THRESHOLD ticks if it has not got there yet. That is
+#  circular, and it is what kept the mesh churning: 2,478 successful attaches
+#  against 2,147 GrandpaTickMissing detaches in one window.
+#
+#  This grace gives a freshly-attached parent time to acquire its SECOND child
+#  before its children start counting misses against it.
+#
+#  Sizing: orphan recovery sends attach requests every tick and relaxes at
+#  ORPHAN_STRICT_PASS_TICKS (6), so a parent that is going to gain a second
+#  child normally does so within a couple of relax cycles. 15 ticks (~75 s) is
+#  ~2.5 cycles — comfortably above the relax window, and far below the dead
+#  WRITER_SETTLE_TICKS = 50 it replaces in spirit. Worst case before a child
+#  gives up on a parent is GRANDPA_SETTLE_TICKS + GRANDPA_MISS_DETACH_THRESHOLD
+#  = 25 ticks (~2 min).
+GRANDPA_SETTLE_TICKS     = 15   # test  ~75s grace on a NEW parent
+# GRANDPA_SETTLE_TICKS   = 30   # prod  ~2.5m
+
+# Consecutive grandpa-tick misses before a child detaches. Was hardcoded in
+# tardis.rs; moved here 2026-08-01 so it is reviewable next to its settle.
+GRANDPA_MISS_DETACH_THRESHOLD = 10   # ~50s of missed chain proof
 
 # ── Reattach (post-partition tree merge, TARDIS §2.16.5) ───────────────────
 REATTACH_STABILITY_TICKS = 20   # leaf must sit with current parent this long before reattach
@@ -60,11 +129,263 @@ TICK_SLOT_PIGGYBACK_MAX = 8   # max slot updates piggybacked on one tick
 #  Tunable magnitudes, expressed in whole AXC for readability. constants.rs
 #  converts to atoms via axiom_denomination::axc(N) — so the atom count is always
 #  derived from ATOMS_PER_AXC, never a hand-mirrored 10^N literal.
-airdrop_pool_initial_axc      = 600_000     # airdrop pool
-dev_treasury_pool_initial_axc = 1_000_000   # dev-AXC treasury (FACT class isolation §4)
+# airdrop + dev-treasury pool sizes MOVED OUT (2026-09-05): they are rows of
+# the genesis distribution table in core/logic/protocol_core.toml, which the
+# build refuses to compile unless it adds up. A copy here was a second home for
+# a number Core declares in FACT #0.
+#  Validator-join subsidy pools (AXIOM_DESIGN_ValidatorJoin.md §2). Both divide
+#  EXACTLY by their tier floor — 400 x 500 and 5 x 500,000 — so neither strands
+#  a remainder nor over-grants. These MUST equal the FACT #0 sub-pool
+#  declarations in core/logic/src/genesis_integrity.rs; the Core-side
+#  `join_pools_drain_to_exactly_zero` test pins the arithmetic, and a
+#  disagreement between these registers and FACT #0 is a divergence bug.
+# ⚠ THE TWO SUBSIDY POOL TOTALS MOVED OUT OF THIS FILE (2026-09-04).
+# They are DERIVED from the genesis distribution table in
+# core/logic/protocol_core.toml (slots x claim), and `core/logic/build.rs`
+# refuses to build if that table does not add up to the declared supply.
+# A copy here would be a third home for one number — which is exactly how a
+# claim came to be minted at 505 while the pool was debited 500.
+# Nabla reads them from `axiom_core_logic` instead; see nabla/src/constants.rs.
+# ⚠ SLOTS x CLAIM, NOT SLOTS x FLOOR (2026-09-04). A claim is an ordinary
+# transaction, so the witness fee comes out of the amount: paying exactly the
+# floor delivered 498.5 AXC against a 500 AXC bar and the candidate could never
+# clear the floor it was funded to reach. The claim pays floor + 5 (TIER3) /
+# floor + 5,000 (TIER2), so these pools carry the allowance too and still drain
+# to exactly zero. The 27,000 AXC came out of Market. `genesis_integrity`
+# asserts both the division and the 100M total.
 
 # ── OODS-tardis + tick-lineage (2026-07-08) ────────────────────────────────
 #  Centralized here from hardcoded copies once duplicated across tardis.rs +
 #  nabla_node.rs (drift risk). See YPX-021 (OODS) + TARDIS §7.6 (lineage).
 OODS_EPOCH_TICKS        = 720   # ~1h @ 5s — OODS-tardis epoch-seed rotation
 LINEAGE_FRESHNESS_TICKS = 3     # |drift| bound for tick-lineage prev_sig freshness
+
+# ── Bloom era sizing (KI#42, 2026-07-28; DECIDED 2026-07-29) ──────
+#  Both SMT membership filters are ERA CHAINS: they rotate on ticks, so a frozen
+#  era's false-positive rate is fixed and only the active era can fill. These
+#  values size each era's filter.
+#
+#  DECISION (2026-07-29 — AXIOM_DESIGN_NablaAntiEntropy.md §12.5):
+#  sized for 25,000 ops/day → 2,250,000 consumed states per 90-day era.
+#  One consumed state ≈ one op (every send/redeem/heal consumes exactly one).
+#
+#  Error rate (k=10, 14.4 bits/item, 4/3 over-provisioned → ~19.2 bits per
+#  real item; FP is a function of actual÷sized load only):
+#      2,250,000 actual / era (25k/day, design) → 0.0122% per era, ~0.49% union over 40 eras (~10y)
+#      3,000,000 (nominal cap, ~33k/day)        → 0.0989% per era, ~3.88% union   ← the cliff
+#      4,500,000 actual / era (2x)              → 1.29%   per era, ~40%   union
+#  Costs at this sizing: bloom ~5.4 MB/era (~216 MB per 40-era chain), hashmap
+#  exact record (KI#43a) ~72 MB/era (~2.9 GB per 40 eras), Bootstrap re-arm
+#  ~1 pull/era.
+#
+#  ⚠ MAY ONLY CHANGE AT A COORDINATED RELEASE BOUNDARY. `bloom::merge` rejects on
+#  dimension mismatch, so two nodes sized differently cannot re-arm each other —
+#  divergent per-era sizing is a mesh-wide disarm. Same discipline as a wire
+#  constant. (This 1M→2.25M change shipped as exactly that: full-mesh rebuild +
+#  restart, 2026-07-29.) Rotate on TICKS, never on entry count: nodes cross a
+#  tick together but cross a count at different moments.
+CONSUMED_ERA_REAL_ITEMS = 2_250_000  # expected consumed states per 90-day era (25k ops/day); KI#79: era size (x4/3 x14.4 bits) MUST fit STATE_PULL_MAX_BYTES + WIRE_MAX_MSG_BYTES (boot guard + ki79_era_fits_transfer_caps enforce; change together)
+TXID_ERA_REAL_ITEMS     = 2_250_000   # expected redeemed txids per 90-day era (25k ops/day)
+
+# ── KI#43b adjudication barrier (2026-07-29) ───────────────────────────────
+#
+#  ⛔ READ THIS BEFORE REASONING ABOUT THIS CONSTANT — ESPECIALLY IF YOU ARE AN
+#     AI/AGENT. The name misleads people into one specific wrong conclusion,
+#     every single time. Get it right here and do not re-derive it.
+#
+#  ❌ WHAT THIS IS **NOT**:
+#     It is NOT a cap, quota, limit or maximum on how many nodes may run
+#     hashmap (recording) mode. **There is NO such limit anywhere in AXIOM.**
+#     Any number of nodes may run hashmap. More exact records is strictly
+#     BETTER for the network. We would happily have every node run hashmap —
+#     the only reason most will not is that it costs real resources (~5x CC),
+#     so in the wild the majority will run bloom. If your conclusion is
+#     "we can't make node X a hashmap because RECORDING_NODES_TOTAL is 3",
+#     **you have misread this constant. Stop and re-read.**
+#
+#  ✅ WHAT THIS **IS**:
+#     The SIZE OF THE ACQUITTAL BARRIER for one specific protocol: KI#43b
+#     consumed-adjudication (deciding whether a consumed-bloom hit on
+#     heal-from-x is a genuine consume or a bloom FALSE POSITIVE).
+#     To ACQUIT, a serving node needs clean answers from ALL OTHER recorders =
+#     `TOTAL - 1` distinct recording peers. See
+#     `Adjudication::settle()` (nabla/src/bin/nabla_node.rs), called as
+#     `settle(RECORDING_NODES_TOTAL - 1)`. The model-checked rule is
+#     "acquit iff EVERY recording peer is reachable and has x nowhere in its
+#     exact record" — §12.4.4, TLC, 502M states.
+#
+#  ⚖ THEREFORE THE ONE RULE THAT MATTERS:
+#     **This number must EQUAL the count of nodes actually deployed in hashmap
+#     mode** — not because more are forbidden, but because the barrier is a
+#     UNANIMITY barrier over that set. The two error directions differ:
+#       • TOO LOW  (more recorders deployed than this says) ⇒ the barrier
+#         settles after hearing only a SUBSET ⇒ **UNSOUND ACQUITTAL**. Bad.
+#       • TOO HIGH (fewer deployed) ⇒ barrier can never settle ⇒ fails closed,
+#         refuses. Safe but unavailable. Hence: FAIL, never silently shrink.
+#     So if you add or remove a recorder, change this in the SAME commit, and
+#     roll all nodes together (deployment-topology constant, same
+#     coordinated-release discipline as the era sizing above).
+#
+#  The deployed recorder set lives in TWO places that must agree with this
+#  number: `scripts/axiom-env.py` (txid_mode) and `deploy/deploy-node.sh`
+#  (TXID_MODE). Currently: **alpha, beta, zeta** — zeta deliberately included
+#  because a recorder on an EXTERNAL host is what makes the barrier meaningful
+#  across hosts. (gamma was briefly a recorder from 2026-07-29 to reach 3
+#  locally; reverted 2026-08-18 — it is bloom.)
+#
+#  Design + model: AXIOM_DESIGN_NablaAntiEntropy.md §12.4.4,
+#  docs/models/consumed_adjudication/.
+RECORDING_NODES_TOTAL = 3             # = |{alpha, beta, zeta}| — keep in step
+
+# (KI#64, 2026-10-01: ADDRESS_RECHECK_INTERVAL_TICKS deleted — the GUIDE §6.1.2
+# own-name re-resolve it timed was superseded by §5.6a-bis peer-observed IPs and
+# the register had no reader; check_ghost_implementations.sh now sees it.)
+
+# ── AE stall alarm (KI#63 §3.3) ───────────────────────────────────────────────
+# On 2026-08-04 anti-entropy rejected 115,054 of 115,054 entries over six hours
+# — replication was dead while looking busy — and NOTHING said so. The soak
+# printed "Real protocol: 100.00%". An outage must not be able to read as a
+# healthy run.
+#
+# Rule: over a window, if AE applied NOTHING while rejecting at least
+# MIN_REJECTS, shout. Both zero (a quiet mesh) is silent by construction.
+# Tick COUNTS, not seconds (KI#47).
+AE_STALL_ALARM_INTERVAL_TICKS = 60    # ~5 min at 5s ticks
+AE_STALL_ALARM_MIN_REJECTS    = 20    # below this a window is not evidence
+# Fork detections required in the window before "applied nothing" means a STALL
+# rather than CONVERGENCE. Without this the alarm fires on a healthy mesh, where
+# applying nothing is the normal steady state (every offered entry is already
+# held). Measured: healthy soak ~2 per window; the 2026-08-04 incident ~208.
+AE_STALL_ALARM_MIN_FORKS      = 20
+
+# ── Tick-denominated durations (KI#47 — read the unit note) ───────────────────
+#  A tick's NUMBER is unix seconds; ticks are PRODUCED every TICK_INTERVAL_SECS.
+#  So a duration "in ticks" is either a VALUE span (= seconds) or an EVENT count
+#  (= seconds / 5). They differ by 5x. See AXIOM_YPX-003_TARDIS.md §1.3.3a.
+#  The three values below are EVENT counts, and their call sites compare them
+#  against VALUE spans — so each currently enforces 1/5th of its stated intent.
+#  Values are moved here UNCHANGED (behaviour-preserving); correcting them is
+#  KI#47, whose fix is to TYPE these as TickCount so rustc finds every site.
+default_era_duration_ticks = 1_555_200   # 90d as a tick COUNT (projected via .to_secs())
+default_era_duration_ticks_dev = 120     # dev ~10m — eras MUST rotate so KI#42/44 get coverage
+
+# ── FOB (Fixed Outflow Balance / Bounded Pools) — docs/AXIOM_DESIGN_BoundedPools.md ──
+# ⚠ TICK COUNTS, not seconds (KI#47). The soak's era cadence is 5 s/tick, so
+# 150_000 ticks ≈ 8.7 d. Writing the "obvious" week number 604_800 here would be
+# a silent 35-day epoch — check_tick_units.sh guards it. The register
+# RELATIONSHIP is a boot guard (FobParams::assert_boot_guard), not convention:
+# fob_tranche_pct% * fob_dust_cutoff_atoms >= fob_tranche_min_atoms >= minimum_tx_atoms.
+# INFRASTRUCTURE params only (Nabla owns the carrier + committee TIMING). Both the
+# tranche ECONOMICS (pct/dust_cutoff/tranche_min) AND the §5 mover ELIGIBILITY floor
+# (fob_mover_oods_floor_pct) moved to Core (protocol_core.toml, 2026-08-09 ruling):
+# Core computes the authoritative amount AND decides who is eligible to author, and
+# every Nabla's Core re-verifies both; a Nabla-only tranche or a Nabla-local
+# eligibility floor fails open (RULE 5). What stays here is pure carrier timing —
+# nothing that gates the validity of a value movement.
+fob_tranche_epoch_duration_ticks     = 150_000       # REAL fund epoch: ~8.7d tick COUNT — projected via constants::fob_epoch_span_secs (KI#165: the raw count was used until 2026-09-25 → 1.74 d)
+fob_tranche_epoch_duration_ticks_dev = 20            # dev-MODE build twin — 20 ticks × 5 s = 100 s per epoch, the SAME wall cadence the dev soaks had before KI#165 (was 100 raw = 100 s); a soak exercises many full tranche→sweep cycles
+
+# ── Contribution emission claim caps (AXIOM_DESIGN_ValidatorEmission.md §7) ──
+#  The airdrop cycle's two cap layers, on the emission pool, per FOB epoch. A
+#  lying node can only INFLATE a claim count (which lowers every share, steals
+#  nothing); the mesh cap bounds one epoch's dilution, the per-Nabla cap keeps
+#  one node from filling an epoch. Suggested 2026-09-14, pending ruling.
+emission_claims_mesh_cap_per_epoch     = 2_000
+emission_claims_mesh_cap_per_epoch_dev = 100
+emission_claims_per_epoch_per_nabla     = 500
+emission_claims_per_epoch_per_nabla_dev = 50
+# DEV-FUND epoch (§10.2a): the @axiom.internal dev fund tranches on THIS short
+# cadence in BOTH builds (no _dev twin → short even in release), so developers
+# test the FOB path continually with dev wallets on a release core while the
+# real fund stays on the weekly cadence above. Class-specific, not build-mode.
+fob_dev_fund_epoch_ticks             = 4             # dev fund: frequent, testable — 4 ticks × 5 s = 20 s per epoch, the same wall cadence as before KI#165 (was 20 raw = 20 s)
+fob_substitution_grace_ticks         = 5             # ranks 4,5… substitute after N ticks if a top-3 mover is silent (§3)
+fob_substitution_grace_ticks_dev     = 2
+runner_claim_ticks         = 17_280      # 24h as a tick COUNT
+runner_claim_ticks_dev     = 12          # dev ~1m
+
+# ── Join probation (GUIDE §5.6c, KI#75, ruled 2026-09-25) ────────────────────
+# A citizen NBC (chain_depth > 0) whose `issued_at` is younger than this many
+# ticks is PROBATIONARY on every node that reads it: never a TARDIS writer, not
+# counted in OODS, no Nabla emission, its Alerts withheld. Judged from the
+# signed certificate only — never a local "joined at" clock — so re-joining,
+# hopping peers or restarting cannot reset it. Genesis (chain_depth == 0) exempt.
+# ⚠ TICK COUNT (KI#47), projected onto the unix-second stamps via
+# `constants::nabla_probation_span_secs` (the KI#40/#165 class). Replaces the
+# .rs const NABLA_PROBATION_SECS (48 h) that was never read in production.
+nabla_probation_ticks      = 34_560      # 48 h at 5 s/tick — "no one can flood with new Nabla to dilute the security"
+nabla_probation_ticks_dev  = 60          # dev twin: 5 min — "in testing should just wait a much shorter time"
+
+# ── NBC issuer self-cap + peer alarm (YPX-002 §9.1.1a, ruled 2026-09-25) ─────
+# An attacker WITHOUT an issuing key can only obtain citizen NBCs from honest
+# issuers' open join endpoints; probation (above) DELAYS that flood, this CAPS
+# it: an issuer REFUSES the N+1-th `NbcIssuanceRequest` it would sign within one
+# FOB epoch (`constants::fob_epoch_span_secs(false)` — the REAL fund's cadence,
+# the mesh's epoch clock; the dev-FUND cadence is a wallet-class bit, not a
+# clock), answering `ISSUER_CAP_REACHED`. Counted from its own signed
+# `issued_at` stamps (epoch = issued_at ÷ span, KI#165 style) and PERSISTED in
+# the snapshot so a restart does not reset the budget. Every peer ALSO counts
+# the certificates it verifies per (issuer, epoch) and logs
+# `[NBC-ISSUER-OVER-CAP]` above N — observability only, never a refusal.
+# Genesis (chain_depth == 0) is exempt on both sides. Not a wall-clock or tick
+# unit: a COUNT of certificates.
+# 20/epoch: ~8.7 d real epoch × 10 genesis issuers = 200 citizen joins/week at
+# the bootstrap — ample for a curated mesh, small against a flood.
+nbc_issuance_max_per_epoch     = 20
+nbc_issuance_max_per_epoch_dev = 1000    # dev-MODE twin (100 s epochs): effectively uncapped for soaks
+
+# ── Receipt freshness on /register (KI#53, 2026-08-02) ──────────────────────
+# Was a BARE LITERAL 300 in registration.rs with no name and no unit — exactly
+# the KI#47 hazard (tick VALUE vs tick COUNT), and invisible to
+# check_tick_units.sh because an unnamed number has no `_SECS`/`_TICKS` suffix
+# to inspect. Named and registered here so it is tunable and unit-declared.
+#
+# ⚠ CURRENTLY INERT, BY CONSTRUCTION. The check runs only `if receipt.tick > 0`,
+# and `K3Receipt::from_witness_values` sets `tick: 0` (the field doc calls 0 the
+# canonical "no timestamp"), so it never fires on a real receipt. Recorded
+# rather than deleted because the field is on the wire and a future producer
+# could populate it.
+#
+# ⚠ AND IT INTERACTS WITH THE SUPPLEMENTAL QUEUE. Pending registrations retry
+# with exponential backoff capped at 1 HOUR (YP-SDK §8.4), so if this check ever
+# went live at 300 it would reject legitimate re-registrations — a queued entry
+# is SUPPOSED to be old. Any value chosen here must exceed the retry horizon, or
+# the queue must carry tick=0. A design decision is owed before it is switched on.
+receipt_staleness_max_ticks = 300
+
+# ── R48 record-AE (Fork Settlement §9o [R58/R59], wave W1, 2026-09-30) ───────
+# The receiver-driven descent over each node's RECORD TRIE (graded legs only —
+# `nabla/src/record_sync.rs`). Every bound below is what a RESPONDER enforces on
+# an ask / what an ASKER enforces on an answer; an ask or answer over a bound is
+# REFUSED and counted (`record_ae_refused_oversize`), never trimmed silently.
+#
+# Shape register: a trie node is INTERNAL iff its subtree holds more than this
+# many leaves, else a BUCKET that ships its keys. It is part of the trie's HASH
+# (a pure function of the leaf set AND this value), so every node of one mesh
+# MUST run the same value — change it only at a coordinated roll.
+record_ae_bucket_split           = 32
+# Prefixes per `Ask::Nodes` — and the per-level frontier budget of one descent
+# (the excess is left for the next descent, which the salted order rotates;
+# counted `record_ae_descents_truncated`). Also the cap on legs one descent
+# queues for fetching.
+record_ae_max_prefixes_per_ask   = 256
+# Legs per `Answer::Legs` (and keys per `Ask::Legs`). ≈ 64 × 178 µs ≈ 11 ms of
+# off-lock verification per answer (§9b R36 cost).
+record_ae_max_legs_per_answer    = 64
+# Serialized bytes per answer (1 MiB, far under `transport::WIRE_MAX_MSG_BYTES`);
+# a page always carries ≥ 1 item, the asker re-asks the rest (resume).
+record_ae_max_answer_bytes       = 1_048_576
+# R59 — asks answered per authenticated `from` per window. One descent is
+# ≈ depth + 1 asks (+1 per 64 legs fetched); two nodes may walk each other in
+# one window.
+record_ae_asks_per_from_per_window = 64
+# R59 — answers this node sends per window, over ALL askers (the global cap).
+# Shedding is liveness only (the asker's descent times out, counted aborted)
+# and is counted `record_ae_shed_global`.
+record_ae_answers_per_window     = 1_024
+# The budget window, in seconds of the node's wall clock (`virtual_secs`).
+record_ae_window_secs            = 30
+# How long an issued ask stays answerable; a descent whose in-flight ask is
+# older is ABORTED (counted) and the peer is walked again later. Seconds of the
+# node's wall clock.
+record_ae_reply_ttl_secs         = 30

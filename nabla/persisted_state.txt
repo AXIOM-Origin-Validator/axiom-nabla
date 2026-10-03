@@ -1,0 +1,36 @@
+# Nabla persisted state — THE wipe / retain manifest (KI#182, 2026-09-25).
+# Generated from and pinned to nabla/src/persistence.rs by two unit tests:
+# a line here that is not in the constants, or a constant not here, fails
+# `cargo test -p axiom-nabla persisted`. Read by scripts/axiom-env.py
+# (`_clean_data`) and deploy/deploy-node.sh (WIPE_DATA=1). Never edit by hand
+# without changing persistence.rs in the same commit.
+#
+#   dir  <name>    — directory under the data dir holding consensus/retention state
+#   file <name>    — file under the data dir holding consensus/retention state
+#   config <name>  — operator configuration; a wipe must NEVER remove it
+dir smt
+dir wal
+dir snapshots
+dir consumed_exact
+file nabla.wal
+file airdrop_pool.state
+file dev_treasury_pool.state
+file deed_pool.state
+file dev_deed_pool.state
+file bootstrap_pool.state
+file foundation_bootstrap_pool.state
+file emission_validators_pool.state
+file emission_nabla_pool.state
+file emission.state
+file fob_pools.cbor
+file fob_claims.cbor
+file fob_tranches.cbor
+file vbc_registrations.cbor
+file validator_net_ledger.cbor
+file validator_dev_net_ledger.cbor
+file held_fee_credits.cbor
+file garbage_chain.state
+config node.toml
+config bootstrap.toml
+config config
+config backups

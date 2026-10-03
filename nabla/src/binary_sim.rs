@@ -35,6 +35,8 @@ pub struct BinaryNodeStatus {
     pub node_id: NodeId,
     pub node_name: String,
     pub needs_parent: bool,
+    /// KI#48 P slot: parked in a host's P slot (needs_parent stays true).
+    pub upstream_pending: bool,
     pub downstream_count: usize,
     pub is_leaf: bool,
     pub has_d_open: bool,
@@ -72,6 +74,9 @@ pub struct BinaryNetworkStats {
     pub tardis_sync_pct: f64,
     pub tardis_writer_pct: f64,
     pub tardis_orphans: usize,
+    /// KI#48: nodes currently parked in a P slot (a subset of `tardis_orphans`,
+    /// because `needs_parent` stays true while parked — by design).
+    pub tardis_parked: usize,
 }
 
 /// A child node process.
@@ -117,6 +122,11 @@ pub struct BinarySimNetwork {
     epoch_ms: u64,
     /// Sim option: 1=default, 2=non-genesis obtain NBC from peers, 3=skip genesis.
     sim_option: u8,
+    /// Children that exited WITHOUT the sim killing them (a panic, a FATAL).
+    /// RULE 6: `alive` used to be a process-handle belief that never changed
+    /// on its own — a panicked child stayed "alive" and its stale status made
+    /// the tree read as orphaned. Polled every step; the gate FAILs on any.
+    pub spontaneous_exits: usize,
 }
 
 impl BinarySimNetwork {
@@ -143,7 +153,68 @@ impl BinarySimNetwork {
             tick_ms,
             epoch_ms,
             sim_option,
+            spontaneous_exits: 0,
         }
+    }
+
+    /// `--fresh`: wipe every node's persisted state under `base_dir` (all but
+    /// its `config/` identity and `node.toml`) so a run starts truly COLD —
+    /// no snapshot, no WAL, no pool state from an earlier run. Returns the
+    /// number of entries removed.
+    pub fn wipe_node_data(base_dir: &std::path::Path, count: usize) -> std::io::Result<usize> {
+        let mut removed = 0;
+        for idx in 0..count {
+            let dir = crate::ceremony::node_config_dir(base_dir, idx).parent().unwrap().to_path_buf();
+            if !dir.exists() { continue; }
+            // REFUSE a LIVE node's directory. The production penguins live in
+            // exactly this layout (`~/axiom/axiom-first-penguin-*`); a sim base
+            // must be one the sim seeded (`--seed-from`), never the fleet's.
+            for marker in ["nabla.pid", "antie", "keys", "lambda.pid"] {
+                if dir.join(marker).exists() {
+                    return Err(std::io::Error::other(format!(
+                        "{} carries '{}' — this is a LIVE node directory, refusing to wipe. \
+                         Seed a separate sim base with --seed-from.", dir.display(), marker)));
+                }
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name == "config" || name == "node.toml" { continue; }
+                let path = entry.path();
+                if path.is_dir() { std::fs::remove_dir_all(&path)?; } else { std::fs::remove_file(&path)?; }
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// `--seed-from`: copy the ten genesis IDENTITIES (`config/` — NBC + Nabla
+    /// keys, nothing else) from a live base into `base_dir`, so a gate runs
+    /// over a throwaway tree and never touches the fleet's data. Refuses to
+    /// seed a base onto itself.
+    pub fn seed_genesis_configs(src_base: &std::path::Path, base_dir: &std::path::Path, count: usize) -> std::io::Result<usize> {
+        if src_base.canonicalize().ok() == base_dir.canonicalize().ok() {
+            return Err(std::io::Error::other("--seed-from must differ from --base-dir"));
+        }
+        const FILES: [&str; 8] = [
+            "nbc.json", "nbc_supporting.json",
+            "nabla_ed25519.key", "nabla_sphincs.key", "nabla_dilithium.key",
+            "nabla_ed25519.pub", "nabla_sphincs.pub", "nabla_dilithium.pub",
+        ];
+        let mut copied = 0;
+        for idx in 0..10.min(count) {
+            let src = crate::ceremony::node_config_dir(src_base, idx);
+            let dst = crate::ceremony::node_config_dir(base_dir, idx);
+            if !src.join("nbc.json").exists() { continue; }
+            std::fs::create_dir_all(&dst)?;
+            for f in FILES {
+                if src.join(f).exists() {
+                    std::fs::copy(src.join(f), dst.join(f))?;
+                    copied += 1;
+                }
+            }
+        }
+        Ok(copied)
     }
 
     /// Update tick interval when speed changes.
@@ -154,6 +225,15 @@ impl BinarySimNetwork {
     /// Number of node slots (alive + dead).
     pub fn nodes_len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// KI#48 P-slot evidence for the sim gate: `(idx, parked, tardis_tick,
+    /// downstream_count)` for every alive node, from its last StatusResponse.
+    pub fn node_tardis_view(&self) -> Vec<(usize, bool, u64, usize)> {
+        self.nodes.iter()
+            .filter(|n| n.alive)
+            .map(|n| (n.idx, n.status.upstream_pending, n.status.tardis_tick, n.status.downstream_count))
+            .collect()
     }
 
     /// Virtual address for node at index.
@@ -170,6 +250,20 @@ impl BinarySimNetwork {
         let data_dir = crate::ceremony::node_config_dir(&self.base_dir, idx)
             .parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
+
+        // §5.6a-bis (2026-08-26): a node REFUSES to start without a node.toml
+        // carrying `external_port`. The binary sim predates that rule and
+        // launched every child straight into the panic — every "sim run" since
+        // then measured ten dead processes (found 2026-09-25 by the KI#48
+        // cold-start gate: `msgs=0`, no StatusResponse ever arrived). The
+        // virtual address is what peers dial, so it is the honest declaration.
+        let node_toml = data_dir.join("node.toml");
+        if !node_toml.exists() {
+            std::fs::write(&node_toml, format!(
+                "name = \"{}\"\nport = {}\nexternal_port = {}\n",
+                crate::ceremony::node_name(idx), virtual_addr.port(), virtual_addr.port(),
+            ))?;
+        }
 
         // Write bootstrap.toml — every node knows all genesis nodes (0-9)
         // plus a few spread-out peers. Mirrors production where genesis are well-known.
@@ -211,7 +305,15 @@ impl BinarySimNetwork {
             .arg("--epoch-ms").arg(self.epoch_ms.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // KI#48: child log output (env_logger → stderr) was discarded,
+            // making node-side TARDIS instrumentation invisible to sim runs.
+            .stderr({
+                let log_dir = self.base_dir.join("sim_logs");
+                std::fs::create_dir_all(&log_dir)?;
+                Stdio::from(std::fs::File::create(
+                    log_dir.join(format!("node{}.stderr.log", idx)),
+                )?)
+            })
             .spawn()?;
 
         let stdin = child.stdin.take().unwrap();
@@ -296,6 +398,17 @@ impl BinarySimNetwork {
     ///
     /// Returns number of messages delivered.
     pub fn step(&mut self) -> u64 {
+        // Phase 0: notice children that died on their own. Without this a
+        // panicked node kept `alive == true` and its LAST status forever.
+        for node in &mut self.nodes {
+            if !node.alive { continue; }
+            if let Ok(Some(status)) = node.child.try_wait() {
+                node.alive = false;
+                self.spontaneous_exits += 1;
+                eprintln!("[BIN-SIM] node{} EXITED on its own at tick {} ({}) — see sim_logs/node{}.stderr.log",
+                    node.idx, self.tick, status, node.idx);
+            }
+        }
         // Phase 1: Spawn nodes (ramp up gradually)
         let spawned = self.nodes.len();
         if spawned < self.target_count {
@@ -335,6 +448,54 @@ impl BinarySimNetwork {
             }
         }
 
+        // KI#48 DIAGNOSTIC (sim-only). The binary reproduction OOMs around T25 on
+        // a message storm — 3.9k -> 165k msgs/tick with only 10 nodes. Knowing
+        // WHICH message dominates is the difference between guessing and seeing.
+        {
+            use std::collections::BTreeMap;
+            let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for (_, env) in &messages {
+                let k = match &env.msg {
+                    WireMessage::Tick(_) => "Tick",
+                    WireMessage::Approval(_) => "Approval",
+                    WireMessage::TardisAttachRequest { .. } => "AttachReq",
+                    WireMessage::TardisAttachResponse { .. } => "AttachResp",
+                    WireMessage::TardisDetach { .. } => "Detach",
+                    WireMessage::Hello { .. } => "Hello",
+                    WireMessage::Gossip(_) => "Gossip",
+                    WireMessage::IntroductionRequest { .. } => "IntroReq",
+                    WireMessage::IntroductionResponse { .. } => "IntroResp",
+                    WireMessage::StatusRequest => "StatusReq",
+                    WireMessage::StatusResponse { .. } => "StatusResp",
+                    _ => "other",
+                };
+                *hist.entry(k).or_insert(0) += 1;
+            }
+            // Per-sender AttachReq counts — is ONE node blasting, or all of them?
+            if self.tick % 5 == 0 {
+                let mut per: BTreeMap<usize, usize> = BTreeMap::new();
+                for (from, env) in &messages {
+                    if matches!(&env.msg, WireMessage::TardisAttachRequest { .. }) {
+                        *per.entry(*from).or_insert(0) += 1;
+                    }
+                }
+                if !per.is_empty() {
+                    let mut v: Vec<_> = per.into_iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1));
+                    let top: Vec<String> =
+                        v.iter().take(4).map(|(i, n)| format!("n{i}={n}")).collect();
+                    println!("[ATTACH-BY-SENDER T{}] senders={} | {}",
+                        self.tick, v.len(), top.join(" "));
+                }
+            }
+            if self.tick % 5 == 0 && !hist.is_empty() {
+                let mut v: Vec<_> = hist.into_iter().collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                let top: Vec<String> = v.iter().take(6).map(|(k, n)| format!("{k}={n}")).collect();
+                println!("[MSG-HIST T{}] total={} | {}", self.tick, messages.len(), top.join(" "));
+            }
+        }
+
         // Phase 3: Route messages to destinations
         let mut delivered = 0u64;
         for (from_idx, env) in &messages {
@@ -342,7 +503,7 @@ impl BinarySimNetwork {
             if matches!(&env.msg, WireMessage::StatusResponse { .. }) {
                 // Capture status inline
                 if let WireMessage::StatusResponse {
-                    node_id, node_name, needs_parent, downstream_count,
+                    node_id, node_name, needs_parent, upstream_pending, downstream_count,
                     is_leaf, has_d_open, alive, smt_len, peer_count,
                     tardis_tick, root_hash, messages_received,
                     upstream_id, d1_id, d2_id,
@@ -356,6 +517,7 @@ impl BinarySimNetwork {
                             node_id: *node_id,
                             node_name: node_name.clone(),
                             needs_parent: *needs_parent,
+                            upstream_pending: *upstream_pending,
                             downstream_count: *downstream_count,
                             is_leaf: *is_leaf,
                             has_d_open: *has_d_open,
@@ -438,6 +600,9 @@ impl BinarySimNetwork {
         let orphans = self.nodes.iter()
             .filter(|n| n.alive && n.status.needs_parent)
             .count();
+        let parked = self.nodes.iter()
+            .filter(|n| n.alive && n.status.upstream_pending)
+            .count();
 
         let sync_pct = if alive_count > 0 {
             (synced as f64 / alive_count as f64) * 100.0
@@ -453,6 +618,18 @@ impl BinarySimNetwork {
             tardis_sync_pct: sync_pct,
             tardis_writer_pct: writer_pct,
             tardis_orphans: orphans,
+            tardis_parked: parked,
+        }
+    }
+
+    /// Kill every child process. Called on sim shutdown — without this every
+    /// run leaked its 10 `nabla-node --mode stdio` children (observed
+    /// 2026-08-01: 90 stale processes from nine prior sim runs).
+    pub fn kill_all(&mut self) {
+        for node in &mut self.nodes {
+            node.alive = false;
+            let _ = node.child.kill();
+            let _ = node.child.wait();
         }
     }
 

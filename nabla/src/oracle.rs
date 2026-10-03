@@ -270,45 +270,12 @@ pub struct PoolQuery {
     pub date: String,
 }
 
-/// Query the pool state for a specific platform.
-/// Validators call this before processing OracleClaim.
-pub fn query_pool(state: &DailyPoolState, platform_idx: usize) -> Result<PoolQuery, OraclePoolError> {
-    if platform_idx >= PLATFORM_COUNT {
-        return Err(OraclePoolError::InvalidPlatform);
-    }
-    Ok(PoolQuery {
-        platform_remaining: state.pools[platform_idx],
-        reserve_remaining: state.reserve_left,
-        reserve_exhausted: state.reserve_left == 0,
-        date: state.date.clone(),
-    })
-}
 
 // ════════════════════════════════════════════════════════════════════════
 // Task 68: Date Utility (TARDIS tick → UTC date)
 // ════════════════════════════════════════════════════════════════════════
 
-/// Convert a TARDIS tick to a UTC date string.
-///
-/// TARDIS ticks are 5 seconds each. Given a genesis timestamp (unix epoch seconds)
-/// and a tick number, compute the UTC date.
-///
-/// In production, the genesis timestamp comes from the genesis block.
-/// For sim, we use a fixed epoch.
-pub fn tick_to_date(genesis_epoch_secs: u64, tick: u64) -> String {
-    let total_secs = genesis_epoch_secs + tick * 5;
-    let days_since_epoch = total_secs / 86_400;
-    // Simple date calculation (no leap second handling — good enough for pool resets)
-    let (year, month, day) = days_from_epoch(days_since_epoch);
-    format!("{:04}-{:02}-{:02}", year, month, day)
-}
 
-/// Check if a tick crosses a day boundary compared to a previous tick.
-pub fn crosses_midnight(genesis_epoch_secs: u64, prev_tick: u64, current_tick: u64) -> bool {
-    let prev_date = tick_to_date(genesis_epoch_secs, prev_tick);
-    let curr_date = tick_to_date(genesis_epoch_secs, current_tick);
-    prev_date != curr_date
-}
 
 /// Convert days since Unix epoch to (year, month, day).
 /// Civil calendar computation (Gregorian).
@@ -357,12 +324,26 @@ mod tests {
     #[test]
     fn daily_allocations_are_correct() {
         let pools = daily_pool_allocations();
-        // Folding@home: 10% of 24_109 = 2_410
-        assert_eq!(pools[0], 2_410);
-        // LHC@home: 9% of 24_109 = 2_169
-        assert_eq!(pools[3], 2_169);
-        // Wikipedia: 8% of 24_109 = 1_928
-        assert_eq!(pools[10], 1_928);
+        // Each platform takes its PLATFORM_WEIGHTS share of DAILY_EMISSION_AXC.
+        // DERIVED, not hardcoded: literals here went stale the moment the
+        // emission rate changed (24,109 -> 23,424, when the Foundation carve
+        // moved the oracle reserve from 88,000,000 to 85,500,000), and a stale
+        // literal fails for the right arithmetic reason, which wastes the
+        // failure. Weight coverage is asserted separately below.
+        for (i, &weight) in PLATFORM_WEIGHTS.iter().enumerate() {
+            assert_eq!(
+                pools[i],
+                DAILY_EMISSION_AXC * weight as u64 / 100,
+                "platform {i} allocation must be its weight share of the daily emission",
+            );
+        }
+        // The weights must still describe a full distribution — otherwise the
+        // loop above would pass trivially against an all-zero weight table.
+        assert_eq!(
+            PLATFORM_WEIGHTS.iter().map(|&w| w as u64).sum::<u64>(),
+            100,
+            "platform weights must sum to 100%",
+        );
         // Total allocated should be close to daily emission
         // (may be slightly less due to integer division)
         let total: u64 = pools.iter().sum();
@@ -615,60 +596,14 @@ mod tests {
 
     // ── Validator Query ──
 
-    #[test]
-    fn query_pool_valid() {
-        let state = DailyPoolState::new();
-        let result = query_pool(&state, 0).unwrap();
 
-        assert_eq!(result.platform_remaining, daily_pool_allocations()[0]);
-        assert_eq!(result.reserve_remaining, TOTAL_RESERVE_AXC);
-        assert!(!result.reserve_exhausted);
-    }
 
-    #[test]
-    fn query_pool_invalid_platform() {
-        let state = DailyPoolState::new();
-        let result = query_pool(&state, 99);
-        assert_eq!(result.unwrap_err(), OraclePoolError::InvalidPlatform);
-    }
-
-    #[test]
-    fn query_pool_exhausted_reserve() {
-        let mut state = DailyPoolState::new();
-        state.reserve_left = 0;
-
-        let result = query_pool(&state, 0).unwrap();
-        assert!(result.reserve_exhausted);
-    }
 
     // ── Date Utility ──
 
-    #[test]
-    fn tick_to_date_epoch() {
-        // Unix epoch = 1970-01-01
-        assert_eq!(tick_to_date(0, 0), "1970-01-01");
-    }
 
-    #[test]
-    fn tick_to_date_one_day() {
-        // 17_280 ticks × 5 sec = 86_400 sec = 1 day
-        assert_eq!(tick_to_date(0, 17_280), "1970-01-02");
-    }
 
-    #[test]
-    fn crosses_midnight_detection() {
-        // Genesis at midnight. Tick 17_279 is still day 1, tick 17_280 is day 2.
-        assert!(!crosses_midnight(0, 0, 17_279));
-        assert!(crosses_midnight(0, 17_279, 17_280));
-    }
 
-    #[test]
-    fn tick_to_date_modern() {
-        // 2027-01-01 00:00:00 UTC = 1798761600 unix seconds
-        let genesis = 1798761600u64;
-        assert_eq!(tick_to_date(genesis, 0), "2027-01-01");
-        assert_eq!(tick_to_date(genesis, 17_280), "2027-01-02");
-    }
 
     // ── Reserve Drain ──
 

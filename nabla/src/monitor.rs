@@ -38,6 +38,165 @@ use std::time::SystemTime;
 /// Default monitor port (6226 to avoid collision with P2P port 6225).
 pub const DEFAULT_MONITOR_PORT: u16 = 6226;
 
+/// ForkSettlement wave 3 `/status` counters (flattened into
+/// `NodeStatusSnapshot`). Gauges are marked; everything else is cumulative
+/// since process start. RULE 3 §2 / RULE 6: each one distinguishes "0" from
+/// "never ran".
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OriginStatus {
+    /// Gauge — origin records held (the TXID RECORDS, §2.4).
+    pub origin_records: u64,
+    /// Gauge — records born contested (R16); a contested record never vouches.
+    pub origin_records_contested: u64,
+    /// Origin (send) records created by `record_verified_leg`.
+    pub origin_records_created: u64,
+    /// Fork Settlement W7b (spec R52c/R52j) — gauge: REDEEM records held (the
+    /// separate redeem ledger — never read as an origin).
+    pub redeem_records: u64,
+    /// Gauge — redeem records born contested (R16).
+    pub redeem_records_contested: u64,
+    /// Redeem records created by `record_verified_leg`.
+    pub redeem_records_created: u64,
+    /// Verified redeem legs that declared an all-zero consumed state ([R33]) —
+    /// since W7c RECORDED as provenance roots (redeem ledger, never the fork
+    /// index); before W7c they were dropped.
+    pub redeem_leg_zero_consumed: u64,
+    /// Spec R52d — records whose declared produced state is not k-bound
+    /// (detection legs, never producers).
+    pub producer_binding_refused: u64,
+    /// KI#226 — messages refused because their `wallet_id` is not a bucket
+    /// derived from their own `client_pk` (door + flood + AE, cumulative).
+    pub wallet_id_key_mismatch: u64,
+    /// Legs a path accepted that `verify_fork_leg` refused (excl. the expected
+    /// redeem / zero-pk). Non-zero = the record hook and the path's own gate
+    /// disagree.
+    pub origin_leg_unrecordable: u64,
+    /// Local fork detections from the records (door / flood / AE).
+    pub origin_fork_claims_detected: u64,
+    /// Verified remote `ForkBan` claims adopted.
+    pub origin_fork_claims_adopted: u64,
+    /// Verdicts (any carrier) that banned ≥1 new key.
+    pub fork_claims_applied: u64,
+    /// Fork claims refused by the ONE `verify_fork_claim` chokepoint, any
+    /// carrier (design-named, [R25]).
+    pub atraxi_evidence_refused: u64,
+    /// [R28] claims re-derived from the persisted records at load that banned
+    /// ≥1 key the node no longer held banned.
+    pub origin_fork_bans_rederived_at_load: u64,
+    /// Txid attestations that vouched an origin.
+    pub origin_attest_vouched: u64,
+    /// Txid attestations that withheld (`origin = None`, tick 0).
+    pub origin_attest_withheld: u64,
+    /// ForkSettlement §9p — of the withheld ones, those SIGNED `Held` (the
+    /// origin descends from a fork / held receive in this node's records).
+    /// `withheld − held` = signed `Unknown` (WAIT). Cumulative.
+    pub origin_attest_held: u64,
+    /// Fork Settlement W7c — provenance derivation visits (cumulative). With
+    /// `provenance_held_states` it tells "ran, found nothing" from "never ran".
+    pub provenance_states_derived: u64,
+    /// Gauge — states whose DERIVED verdict is HELD (descend from a fork or a
+    /// held receive; nothing sent from them is vouched).
+    pub provenance_held_states: u64,
+    /// Gauge — legs queued for re-derivation. Non-zero ⇒ this node vouches
+    /// nothing until drained (fail closed).
+    pub provenance_dirty_queue: u64,
+    /// ForkSettlement §9r (F-6 path 11) — gauge: redeem fee credits PARKED
+    /// because the redeemed cheque is held/waiting in this node's provenance.
+    pub fee_credits_held: u64,
+    /// Cumulative — redeem fee credits parked / released (credited once on Ok).
+    /// `parked − released − held` ≠ 0 only across a restart (the gauge is
+    /// persisted, the counters are not).
+    pub fee_credits_parked: u64,
+    pub fee_credits_released: u64,
+    /// Gauge — this node's boot floor (`virtual_secs` when `recv_loop` went
+    /// live, re-floored after a tick-loop stall, R9/R13). 0 = not yet
+    /// listening (the node vouches nothing).
+    pub origin_boot_secs: u64,
+    /// R13 re-floors: consecutive tick-loop iterations further apart than the
+    /// DEV settle twin (R34).
+    pub origin_boot_refloors: u64,
+    /// `BanTable::refused_malformed` — bans refused for malformed E1
+    /// evidence (never surfaced before wave 3).
+    pub ban_refused_malformed: u64,
+    /// Undecodable WAL `Ban` records refused at replay ([R36]).
+    pub wal_ban_decode_refused: u64,
+    /// Failed writes of the ONE Nabla ban file (`nabla_bans.txt`, the list a
+    /// co-located ANTIE reads). Non-zero = ANTIE may be reading a stale list.
+    pub ban_file_write_failed: u64,
+    // ── Fork Settlement §9o [R58/R59] (W1) — R48 record-AE ──
+    /// Record-AE asks this node sent (every descent step, the root included).
+    pub record_ae_asks_sent: u64,
+    /// Record-AE answers this node signed and sent.
+    pub record_ae_answers_sent: u64,
+    /// Record-AE asks / answers REFUSED, all kinds (the sum of the seven below).
+    pub record_ae_refused: u64,
+    /// …no verified NBC for `from`.
+    pub record_ae_refused_unknown_sender: u64,
+    /// …signature not by `from`'s NBC key (spoofed `from`, tampered body).
+    pub record_ae_refused_bad_signature: u64,
+    /// …an ask nonce already answered.
+    pub record_ae_refused_replayed_nonce: u64,
+    /// …`from` over its asks-per-window budget.
+    pub record_ae_refused_over_budget: u64,
+    /// …an answer to no live ask of ours (spoofed / replayed / late).
+    pub record_ae_refused_unsolicited: u64,
+    /// …an ask / answer over a count bound.
+    pub record_ae_refused_oversize: u64,
+    /// …malformed (invalid prefix, empty ask, ill-formed view, wrong kind).
+    pub record_ae_refused_malformed: u64,
+    /// Authenticated asks SHED at the global answers-per-window cap (liveness).
+    pub record_ae_shed_global: u64,
+    /// Descents that reached the leaves with nothing cut.
+    pub record_ae_descents_completed: u64,
+    /// Descents that timed out, made no progress, or lost their peer.
+    pub record_ae_descents_aborted: u64,
+    /// Descents that ended with part of a level / of the wanted legs left for
+    /// the next descent (the per-level budget).
+    pub record_ae_descents_truncated: u64,
+    /// Legs carried by accepted answers.
+    pub record_ae_legs_received: u64,
+    /// …asked, but refused by `verify_fork_leg` (off the lock).
+    pub record_ae_legs_refused: u64,
+    /// …GRADED and recorded as new records (receiver clock, R16 here).
+    pub record_ae_legs_recorded: u64,
+    /// …verified but UNGRADED here (directory lag) — detect-only, not stored.
+    pub record_ae_legs_ungraded: u64,
+    /// …not asked — refused unverified.
+    pub record_ae_legs_unrequested: u64,
+    /// Held ungraded records replaced in place by a graded copy (first_seen
+    /// and contested kept).
+    pub origin_records_upgraded: u64,
+    /// Gauge — leaves in this node's record trie (graded records).
+    pub record_trie_leaves: u64,
+    // ── Fork Settlement §9o [R56/R57] (W2/W3) ──
+    /// `SeqForkBan` gossip DROPPED — check-3, its only emitter, is retired
+    /// (KI#235); the variant is a tombstone. Non-zero = a pre-W2 build or a
+    /// hostile party on the mesh. Never adopted, never forwarded.
+    pub seqforkban_dropped: u64,
+    /// Fork Settlement §9q (B2) — `HalAdvance` gossip DROPPED: the E3 arm
+    /// (KI#34 check-3's `previous_states` freeze) is retired and HAL re-anchors
+    /// flood as `StateUpdate` with their leg; the variant is a tombstone.
+    /// Non-zero = a pre-B2 build or a hostile party on the mesh.
+    pub haladvance_dropped: u64,
+    /// ForkSettlement §9r-E4 — `TaintAlert` gossip DROPPED: §32 taint is retired
+    /// into ATRAXI A5 (`provenance.rs`); the variant is a tombstone. Non-zero =
+    /// a pre-E4 build or a hostile party (the old arm let anyone block a proven
+    /// forker's downstream at the door). Replaces `taint_applied` /
+    /// `taint_unconfirmed`.
+    pub taintalert_dropped: u64,
+    /// ForkSettlement §9r-E4 (D-E4-1) — `MergeResolved` gossip DROPPED (its
+    /// only emitter, the 75 s quarantine expiry, is deleted).
+    pub mergeresolved_dropped: u64,
+    /// AE entries whose non-`Normal` status was DISCARDED before the merge —
+    /// the leaf status is a local projection (KI#236). Expected non-zero
+    /// wherever a peer holds a local hold; also what a forged push looks like.
+    pub ae_status_discarded: u64,
+    /// Restored leaves at `open` whose status this node cannot back (`Banned`
+    /// without a BanTable entry, plus `Frozen` / `Tainted`). Counted, never
+    /// changed.
+    pub status_unbacked_at_load: u64,
+}
+
 /// Complete node status snapshot — collected once and served to all endpoints.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeStatusSnapshot {
@@ -77,11 +236,42 @@ pub struct NodeStatusSnapshot {
     /// this to decide when to bump `--bloom-size`.
     #[serde(default)]
     pub txid_bloom_fpr: f64,
+    /// KI#42 — fill ratio of the txid bloom against its design capacity
+    /// (`DEFAULT_BLOOM_EXPECTED_ITEMS`). >1.0 means the network has outgrown the
+    /// filter; the FPR above climbs steeply past that point.
+    #[serde(default)]
+    pub txid_bloom_fill_ratio: f64,
+    /// KI#42 — the CONSUMED-STATE bloom, which previously had no exposed health
+    /// signal at all. Its false positives fail CLOSED at the A12 anti-rollback
+    /// gate, refusing legitimate registrations as replays, so this is the more
+    /// consequential of the two filters to watch. Both are lifetime filters that
+    /// never roll over: these numbers only climb. Plan:
+    /// `AXIOM_DESIGN_NablaAntiEntropy.md` §12.
+    #[serde(default)]
+    pub consumed_bloom_count: u64,
+    #[serde(default)]
+    pub consumed_bloom_fpr: f64,
+    #[serde(default)]
+    pub consumed_bloom_fill_ratio: f64,
 
     // ── Network ──
     pub listen_addr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wan_addr: Option<String>,
+
+    /// Unix seconds when this snapshot was BUILT — not when it was served.
+    /// `/status` serves a cached snapshot whenever the node lock is contended
+    /// (see the try_lock path in nabla_node.rs: a blocking lock once wedged
+    /// the accept loop and killed the dashboard for days on busy hashmap
+    /// recorders). That fallback is correct, but without this stamp it is
+    /// INVISIBLE: a permanently contended node serves one frozen snapshot
+    /// forever and every consumer reads it as live. Measured 2026-09-01 —
+    /// zeta reported the same `current_tick` for 20+ minutes while its TARDIS
+    /// ticked normally, which made `driver.py tardis` report a 1000 s tick
+    /// spread and a second root_hash on a converged mesh. A status surface
+    /// that cannot be told from a lying one is worse than no status surface,
+    /// so: stamp it, and let the reader decide.
+    pub built_at: u64,
 
     // ── TARDIS ──
     pub current_tick: u64,
@@ -90,6 +280,66 @@ pub struct NodeStatusSnapshot {
     pub has_upstream: bool,
     pub downstream_count: usize,
     pub is_writer: bool,
+    /// GUIDE §5.6a — peers do not all observe the same source address for us,
+    /// so we are demoted to a READ node. RULE 3: a security-relevant demotion
+    /// needs a COUNTER, not just a log line — without this, "never disputed"
+    /// and "the check never ran" are indistinguishable on a live node.
+    pub address_disputed: bool,
+    /// How many distinct peers have reported our source address. 0 means the
+    /// check has had NOTHING to evaluate — that is missing coverage, not a pass.
+    pub address_reports: usize,
+    /// GUIDE §5.6a — the ACTUAL reports behind `address_reports`: who observed
+    /// us, and at what source address.
+    ///
+    /// ⚠ WHY THIS EXISTS. Until 2026-08-26 `/status` carried only the COUNT and
+    /// the verdict (`address_reports`, `address_disputed`) — a conclusion with
+    /// its evidence withheld. An operator seeing `disputed: true` could not tell
+    /// WHICH addresses disagreed or WHO reported them, which is the entire
+    /// diagnostic content. Worse in the other direction: `address_reports: 0`
+    /// looked identical whether nobody had reported or the mechanism was inert,
+    /// and on the Pi it was inert for six days without anything able to say so.
+    ///
+    /// A demotion is security-relevant, so it needs more than a boolean
+    /// (RULE 3): a rejection you cannot inspect cannot be distinguished from a
+    /// rejection that never ran.
+    pub address_observers: Vec<AddressObservation>,
+    /// GUIDE §5.6a — peers AGREE on our address, but it is not globally
+    /// routable (private / loopback / link-local / CGNAT). We are demoted to
+    /// READ for a reason DISTINCT from disagreement, and the two need
+    /// different operator responses: a dispute means fix your network view,
+    /// this means you have no WAN address at all.
+    ///
+    /// `address_disputed` stays the single predicate the write gate reads;
+    /// this says WHY it is true (RULE 3 — a demotion an operator cannot
+    /// explain is a demotion they will work around).
+    pub address_unroutable: bool,
+    /// Own NBC — the node's identity certificate. NONE of this was on `/status`
+    /// before 2026-08-26, so an operator could not answer "how old is my
+    /// certificate, when does it expire, and who issued it?" from the one
+    /// surface they have. `nbc_expires_at` matters operationally: an expired NBC
+    /// takes the node out of the mesh, and renewal is the ONE sanctioned
+    /// periodic Nabla dependency a validator has.
+    pub nbc_issued_at: u64,
+    pub nbc_expires_at: u64,
+    /// Seconds until expiry at the moment this snapshot was taken. Negative
+    /// means ALREADY EXPIRED — surfaced as a signed value rather than clamped,
+    /// because "expired 40 minutes ago" and "expires in 0s" are different
+    /// operational situations.
+    pub nbc_expires_in_secs: i64,
+    /// 0 = genesis (ceremony-issued, address curated in the seed list and
+    /// therefore exempt from §5.6a self-checking); >0 = citizen, issued by a
+    /// peer at that chain depth.
+    pub nbc_chain_depth: u8,
+    /// Who issued it — "ceremony" for genesis, else the issuing peer's name.
+    pub nbc_issuer: String,
+    /// §5.6a-bis — `SlotAvailable` hints discarded because we hold no OBSERVED
+    /// address for the announcing node, so its open slot is not dialable.
+    ///
+    /// RULE 3 shape 2: the hint is now identity-only, so a node we have never
+    /// contacted can tell us it has a slot but not where it is. Dropping that
+    /// is correct; dropping it SILENTLY is not — "we discard every hint" and
+    /// "no hints ever arrive" would render identically.
+    pub slot_hints_dropped_unobserved: u64,
     pub d1_approved: bool,
     pub d2_approved: bool,
 
@@ -107,6 +357,125 @@ pub struct NodeStatusSnapshot {
     /// rotation, the cooldown gate is wedged.
     #[serde(default)]
     pub rebalance_cooldown: u8,
+    /// Orphan-cause counters (KI#48 observability). Why this node has lost its
+    /// upstream, split two ways: `via_*` = the code path that cleared `up`
+    /// (counts paths that orphan a node WITHOUT emitting a DetachReason);
+    /// `detach_*` = the protocol reason on TardisAction::DetachUpstream,
+    /// counted where it is emitted because the handler calls remove_peer() and
+    /// the reason is lost by the time `up` is cleared.
+    ///
+    /// Live-mesh equivalent of `sim.rs::OrphanCause`, which could not be reused:
+    /// that enum predates the grandpa rule and has no GrandpaTickMissing variant
+    /// (~95% of real detaches), and its WriterCheck is "disabled v0.9.1".
+    #[serde(default)]
+    pub orphan_causes: std::collections::BTreeMap<String, u64>,
+    /// §7.6 lineage verification outcomes (see nabla_node.rs). Present so the
+    /// check is observable at `info` — `[LINEAGE-OK]` is debug + rate-limited.
+    #[serde(default)]
+    pub lineage_ok: u64,
+    #[serde(default)]
+    pub lineage_reject: u64,
+    #[serde(default)]
+    pub lineage_skip: u64,
+    /// Self-contradiction flags suppressed because the answer matched our own
+    /// root (§5.5.1 exonerate-only guard). Exposed so the guard is observable —
+    /// a silent guard is indistinguishable from a dead one.
+    #[serde(default)]
+    pub audit_exonerated: u64,
+    /// KI#71 — the §5.5 bottom-up audit counters (`TardisNode::audit_counters`):
+    /// `selfcontra_flags` isolates SELF-CONTRADICTION convictions (which
+    /// `orphan_causes.via_flag_questionable` mixes with merkle-proof and cascade
+    /// causes); `response_stale`, `responses_unmatched`, `responses_unauthorized`,
+    /// `requests_shed`, `exonerated`.
+    #[serde(default)]
+    pub tardis_audit: std::collections::BTreeMap<String, u64>,
+    /// TickHash advertisements accepted / rejected as audit evidence (§5.5).
+    #[serde(default)]
+    pub tickhash_verified: u64,
+    #[serde(default)]
+    pub tickhash_unverified: u64,
+    /// Alerts whose carried evidence proved / did not prove the accusation.
+    #[serde(default)]
+    pub alert_proven: u64,
+    #[serde(default)]
+    pub alert_unproven: u64,
+    /// §5.6 alert quorums met but NOT acted on because the forwarder's identity
+    /// could not be proven (ghost audit G4 / **KI#72** — the doc here said KI#71,
+    /// which is the TARDIS-churn issue, not this one).
+    ///
+    /// Since KI#72 shipped the per-hop `Alert.intermediate_sig`, a hop from a
+    /// peer whose NBC we hold IS provable, so this should stay 0 in a healthy
+    /// mesh. Non-zero now means alerts are arriving from nodes we cannot
+    /// attribute — or that `--skip-verify` is on, which forces `None`.
+    #[serde(default)]
+    pub quarantine_withheld: u64,
+    /// KI#63(c) — `AE_STALL_ALARM_INTERVAL_TICKS` windows in which anti-entropy
+    /// applied NOTHING while rejecting a meaningful number of entries
+    /// (`ae_stall_detected`). The `[AE-STALL]` log line alone is unobservable
+    /// from a dashboard or a gate (RULE 3 §2); this is the same verdict as a
+    /// counter. Non-zero = replication was not converging for at least one
+    /// window — the condition that read as a healthy run for six hours on
+    /// 2026-08-04.
+    #[serde(default)]
+    pub ae_stall_windows: u64,
+    /// §5.2.2c KI#132 — registers that declared a LIVE stake lock and were NOT
+    /// the wallet's own stake claim.
+    ///
+    /// ⚠ **NON-ZERO MEANS A CORE GATE LEAKED.** Core's CL1 send gate and CL5
+    /// redeem gate should make this unreachable: a stake-locked wallet cannot
+    /// produce a registerable receipt except the claim redeem that stamps the
+    /// lock, which is excluded here. Nabla refuses nothing on this (it fails
+    /// open by design and is not the enforcement) — it REPORTS.
+    #[serde(default)]
+    pub stake_lock_observed_not_own_claim: u64,
+    /// §5.5 audit responses refused: sender was not our upstream (a
+    /// denial-of-audit attempt), or matched no pending challenge.
+    #[serde(default)]
+    pub audit_resp_unauthorized: u64,
+    #[serde(default)]
+    pub audit_resp_unmatched: u64,
+    /// G8 — PoolSync dropped for an unresolvable sender NBC. Non-zero at a
+    /// steady rate means honest PoolSync is being lost (a known-open bug);
+    /// the per-event line is `debug!` and invisible in production.
+    #[serde(default)]
+    pub poolsync_drop_unverified: u64,
+    /// G16 — approvals accepted WITHOUT signature verification (`--skip-verify`,
+    /// implied by `--dev`). Non-zero means this node's YPX-003 writer
+    /// qualification rests on unauthenticated approvals.
+    #[serde(default)]
+    pub approvals_unverified: u64,
+    /// KI#72 — Alert hops with a PROVEN `intermediate_emitter` (verified against
+    /// its NBC-bound Ed25519 key) vs. hops that could not be proven. `unproven`
+    /// non-zero means alerts are arriving that cannot be attributed.
+    #[serde(default)]
+    pub alert_identity_proven: u64,
+    #[serde(default)]
+    pub alert_identity_unproven: u64,
+    /// G11 — WAL deep-scan RECOVERIES. Counts truncations performed, not raw
+    /// findings.
+    ///
+    /// This comment previously said the deep scan "has NO recovery path" and
+    /// that "nothing was done". True when written; G11 wired
+    /// `audit_deep_and_recover` the same day, once KI#74 made the detector
+    /// trustworthy. Left stale it would have been exactly the shape RULE 3
+    /// calls out — a comment describing behaviour the code no longer has.
+    ///
+    /// Recovery truncates at the reader's CLEAN PREFIX (not at
+    /// `min(corrupted)`, which would keep the corrupt entry and loop forever).
+    /// Non-zero is a hardware-error signal if it repeats.
+    #[serde(default)]
+    pub wal_deep_scan_corrupt: u64,
+    /// G15 — H3 data-availability messages received for an UNBUILT protocol
+    /// (no emitter, no CHALLENGE_WINDOW_TICKS, no SCAR path). Dropped, never
+    /// relayed. Non-zero means something is emitting them.
+    #[serde(default)]
+    pub h3_unbuilt_dropped: u64,
+    /// KI#222 — `BanAlert` gossip messages DROPPED by the retired receiver
+    /// (forgeable E1 proof, no honest emitter; the variant is a bincode
+    /// tombstone). Nothing honest sends one, so non-zero means a stale build or
+    /// an attempted false ban is on the mesh.
+    #[serde(default)]
+    pub ki222_banalert_dropped: u64,
 
     // ── SMT / Data ──
     pub root_hash_hex: String,
@@ -157,6 +526,15 @@ pub struct NodeStatusSnapshot {
     pub dev_pool_claims: u64,
     pub dev_pool_local_claims: u64,
 
+    // ── Bootstrap subsidy pools (ValidatorJoin §5.2.3; KI#250 gap note) ──
+    // Before KI#250 these two pools were invisible on /status, so a drain
+    // (refused-but-debited claims) could only be found by reading the
+    // persisted `*_pool.state` files (`scripts/read_subsidy_pools.py`).
+    pub bootstrap_pool_balance: u64,
+    pub bootstrap_pool_claims: u64,
+    pub foundation_pool_balance: u64,
+    pub foundation_pool_claims: u64,
+
     // ── DEED ──
     pub deed_collected: u64,
     pub deed_split: String,
@@ -182,6 +560,42 @@ pub struct NodeStatusSnapshot {
     pub dev_deed_pool_balance: u64,
     #[serde(default)]
     pub dev_deed_pool_total_credited: u64,
+
+    /// FOB (Fixed Outflow Balance / Bounded Pools) — tranche activity counters.
+    /// `authored` = statements this node broadcast (recording nodes only);
+    /// `applied` = statements judged valid + debited into local pools;
+    /// `rejected` = statements failed crypto/judge (RULE 3: a reject is a
+    /// counter, not just a log). See `docs/AXIOM_DESIGN_BoundedPools.md`.
+    /// FOB pool balances (§10.0 dashboard display): "vidhex16:class:balance"
+    /// per pool, sorted. Recording nodes only; empty on bloom nodes.
+    #[serde(default)]
+    pub fob_pools: Vec<String>,
+    #[serde(default)]
+    pub fob_tranches_authored: u64,
+    #[serde(default)]
+    pub fob_tranches_applied: u64,
+    #[serde(default)]
+    pub fob_tranches_rejected: u64,
+    #[serde(default)]
+    pub fob_conservation_rejects: u64,
+    /// Contribution emission (`AXIOM_DESIGN_ValidatorEmission.md`): the epoch this
+    /// node last rolled to, rolls since boot, atoms drawn from DEED, claims granted
+    /// and refused (RULE 6 — every path observable).
+    #[serde(default)]
+    pub emission_epoch: u64,
+    #[serde(default)]
+    pub emission_rolls: u64,
+    #[serde(default)]
+    pub emission_top_up_atoms: u64,
+    #[serde(default)]
+    pub emission_claims_ok: u64,
+    #[serde(default)]
+    pub emission_claims_refused: u64,
+    /// KI#193 residual — epoch rolls refused because DEED moved fewer atoms than
+    /// requested (the debit and the credit must be equal). Non-zero = the
+    /// DEED→emission transfer did not conserve and the epoch did NOT roll.
+    #[serde(default)]
+    pub emission_conservation_refusals: u64,
 
     // ── Gossip ──
     pub gossip_seen_count: usize,
@@ -224,6 +638,19 @@ pub struct NodeStatusSnapshot {
     /// structured lines. See node.rs `TardisNode::tick_sig_failures`.
     #[serde(default)]
     pub tick_sig_failures: u64,
+    /// YPX-003 §2.1 (KI#48, RULED 2026-09-25) — this node is PARKED in a
+    /// host's P slot right now: receiving the host's ticks, `needs_parent`
+    /// still true, still seeking a D seat (`tardis_slot` reads "Parked").
+    #[serde(default)]
+    pub tardis_parked: bool,
+    /// P grants this node accepted as a requester (cumulative), and parks
+    /// that ended by landing a D slot elsewhere. A rising `grants` with a
+    /// flat `to_seated` on a mesh with open D slots = the "keep seeking"
+    /// half is not working (the 08-01 stall shape).
+    #[serde(default)]
+    pub tardis_parked_grants: u64,
+    #[serde(default)]
+    pub tardis_parked_to_seated: u64,
 
     /// Phase B Layer 4: number of currently-active mesh-wide
     /// quarantines this Nabla is enforcing. Non-zero means we are
@@ -239,6 +666,55 @@ pub struct NodeStatusSnapshot {
     /// fires, bucket removed) or expires (sweep at window close).
     #[serde(default)]
     pub quarantine_pending_count: usize,
+    /// KI#191 residual (RULED 2026-09-25, NablaJudoon §2.5) — emission-pool
+    /// PoolSyncs whose structural violation escalated to JUDOON probation on
+    /// this node, cumulative since start. ONE RULE FOR EVERY POOL: this is the
+    /// same `PoolStructuralViolation` path the airdrop pool takes. The first
+    /// soak after the build must show 0 here (precondition measured: 0
+    /// structural warnings live). Non-zero = a peer advertised an emission
+    /// snapshot that violates the conservation identity.
+    #[serde(default)]
+    pub emission_structural_violations: u64,
+    /// YPX-002 §9.1.1a (RULED 2026-09-25) — NBC issuer self-cap + peer alarm.
+    /// `nbc_issued_this_epoch`: certificates THIS node signed in the current
+    /// FOB epoch (budget, persisted). `nbc_issuance_refused_cap`: requests
+    /// answered `ISSUER_CAP_REACHED`, cumulative. `nbc_issuer_over_cap_seen`:
+    /// verified citizen certificates that took some issuer's per-epoch count
+    /// above the cap — `[NBC-ISSUER-OVER-CAP]` — observability only.
+    #[serde(default)]
+    pub nbc_issued_this_epoch: u64,
+    #[serde(default)]
+    pub nbc_issuance_refused_cap: u64,
+    #[serde(default)]
+    pub nbc_issuer_over_cap_seen: u64,
+
+    // ── GUIDE §5.6c join probation (KI#75) ──
+    /// Peers in `verified_nbcs` whose NBC is inside the probation window
+    /// (`cc::is_probationary` at the current tick). Not counted in OODS,
+    /// skipped as upstream candidates, Alerts withheld.
+    #[serde(default)]
+    pub probationary_peers: usize,
+    /// Refusals this node issued BECAUSE of probation, summed over the three
+    /// refusing levers: TardisAttachRequests refused while OUR NBC was
+    /// probationary + EmissionNabla claims answered NOT_ELIGIBLE for a
+    /// probationary certificate + Alerts withheld from probationary peers.
+    /// Cumulative since start. "0" with `probationary_peers > 0` and no
+    /// traffic is normal; "0" forever on a busy mesh means a lever is dead
+    /// (RULE 3 §2).
+    #[serde(default)]
+    pub probation_refusals: u64,
+    /// Lever 5 — the pool kinds for which at least one AUTHENTICATED
+    /// PoolSync has been applied since start (`PoolKind::status_name`).
+    /// The serve-gate stays `not_ready_syncing` until every
+    /// `PoolKind::SERVE_GATE_KINDS` entry is present.
+    #[serde(default)]
+    pub pool_synced_kinds: Vec<String>,
+    /// Lever 5 — true once every serve-gate pool kind has synced (or the
+    /// node is the first of its mesh, which has nobody to sync from — the
+    /// same KI#42 exemption as `anti_rollback_armed`). While false the node
+    /// refuses every registration even when `anti_rollback_armed` is true.
+    #[serde(default)]
+    pub pool_sync_gate_open: bool,
 
     // ── Scoring ──
     pub penguin_score: u64,
@@ -272,8 +748,129 @@ pub struct NodeStatusSnapshot {
     pub bootstrap_peers: Vec<BootstrapPeerEntry>,
 
     // ── Health ──
+    /// KI#79 — the KI#42 serve-gate: is this node serving registrations?
+    /// UNARMED means every registration is refused, which for 8 hours on
+    /// delta (2026-08-07) coexisted with `healthy: true` because no status
+    /// field carried it.
+    #[serde(default)]
+    pub anti_rollback_armed: bool,
+    /// KI#79 — consecutive bootstrap-pull rounds spent unarmed (0 when armed).
+    #[serde(default)]
+    pub unarmed_rounds: u64,
+    /// KI#79 — TARDIS tick span (tick VALUE = unix secs, KI#47) of the
+    /// current unarmed episode (0 when armed or unknown).
+    #[serde(default)]
+    pub unarmed_ticks: u64,
+    /// KI#65 — same-seq provisional consumed-marks manufactured (cumulative).
+    /// A lateral same-seq head swap records a FALSIFIABLE mark instead of a
+    /// permanent bloom entry; this counter makes the manufacture visible
+    /// instead of invisible-until-it-vetoes (RULE 3 §2).
+    #[serde(default)]
+    pub same_seq_marks_manufactured: u64,
+    /// KI#65 — provisional marks cleared by a seq advance (cumulative).
+    #[serde(default)]
+    pub same_seq_marks_cleared: u64,
+    /// KI#65 — provisional marks currently active (gauge).
+    #[serde(default)]
+    pub same_seq_marks_active: u64,
+    /// YPX-025 ATRAXI — (wallet, state) keys currently HELD (gauge).
+    #[serde(default)]
+    pub atraxi_open_keys: u64,
+    /// YPX-025 ATRAXI — claims opened / operations refused because HELD (cumulative).
+    #[serde(default)]
+    pub atraxi_claims_opened: u64,
+    #[serde(default)]
+    pub atraxi_held_refusals: u64,
+    /// YPX-022 §2.1.2a (KI#205) — cheque claims refused
+    /// `CLAIM_UNAUTHENTICATED` (bad claimant signature, address not bound to
+    /// the key, or key ≠ this node's registered head), local TCP path + gossip
+    /// receive arm, cumulative. RULE 3 §2: without this, "0 refusals" and
+    /// "the check never ran" read identically.
+    #[serde(default)]
+    pub claims_unauthenticated: u64,
+    /// YPX-022 §2.1.2a (KI#205) — recalls refused `CLAIMED` because the
+    /// addressed receiver's authenticated claim was live (cumulative).
+    /// Non-zero is the double-settlement being STOPPED, not an error.
+    #[serde(default)]
+    pub recalls_refused_claimed: u64,
+    /// ForkSettlement wave 2a (§2.3 [R17], [R‑MEDIUM-3]) — carried legs
+    /// refused because the preimage did not reproduce the k-signed
+    /// commitment/txid (or disagreed with the message's pk / parent / seq, or
+    /// the register lacked a witness-sig quorum): register door step 5b′ +
+    /// StateUpdate flood + anti-entropy, cumulative. RULE 3 §2.
+    pub leg_preimage_refused: u64,
+    /// KI#224 (owner ruling 2026-10-02) — carried witness proofs NOT counted
+    /// as attesting a head because a witness key is not in this node's R42
+    /// directory: register door 5b⁗ refusals + flood + head-AE, cumulative.
+    /// Non-zero while the directory fills (fresh / wiped node) is expected —
+    /// the head is re-offered; growth on a full directory is junk-witness
+    /// traffic being stopped. RULE 3 §2.
+    pub witness_not_in_directory_refused: u64,
+    /// KI#251 — registrations whose DECLARED §15 state did not reproduce the
+    /// receipt's k-signed `state_hash` at the door's stake-lock recompute,
+    /// passed un-judged (non-fatal this rotation). Expected 0 from honest
+    /// clients; one soak at 0 promotes the recompute to a refusal. RULE 3 §2.
+    pub declared_state_unanchored: u64,
+    /// KI#248 (owner ruling 2026-10-02) — WAL reads that REFUSED an entry
+    /// with no checksum (a torn tail; no legacy WAL exists pre-mainnet):
+    /// not replayed, replay `clean = false`. Per read (audits re-read).
+    pub wal_checksum_missing_refused: u64,
+    /// Snapshot files this process REFUSED to load (undecodable — the
+    /// persisted-shape hazard of rotation #14), cumulative since start. A
+    /// refused snapshot falls back to WAL replay / clean + anti-entropy, which
+    /// is survivable but LOSES every snapshot-only fact; non-zero here is the
+    /// signal that a restart did that. RULE 6: "0" and "never looked" differ.
+    pub snapshot_decode_refused: u64,
+    /// ForkSettlement wave 4a (R42) — certificates REFUSED admission to the
+    /// witness directory (registration or AE adopt: oversize chain, not a VBC,
+    /// provisional, unstamped, unbound stamp, unverifiable), cumulative.
+    pub vbc_directory_refused: u64,
+    /// ValidatorJoin §6b.13 (KI#225) — certificates REFUSED a stamp because the
+    /// stake wallet's registered head carried no stake floor reaching the
+    /// certificate's expiry (§6b.4 check 5), cumulative. RULE 3 §2.
+    pub vbc_stamp_refused_no_floor: u64,
+    /// ForkSettlement §9r F-1(c) (KI#244) — certificates REFUSED a stamp
+    /// because the stake wallet's registered head is HELD by this node's
+    /// provenance (ATRAXI A5), cumulative. RULE 3 §2.
+    pub vbc_stamp_refused_held: u64,
+    /// …answered `WAIT` (no provenance verdict for the head yet; retryable),
+    /// cumulative.
+    pub vbc_stamp_refused_wait: u64,
+    /// ForkSettlement wave 4a — `vbc_registrations.cbor` files refused at boot
+    /// (pre-4a shape or corrupt; the directory then starts EMPTY). Non-zero
+    /// after a retain rotation is EXPECTED once and means validators must
+    /// re-register; "0" and "never looked" differ (RULE 6).
+    pub vbc_registry_decode_refused: u64,
+    /// ForkSettlement wave 4a (R50) — directory AE requests / replies refused
+    /// (unknown sender, bad signature, replayed nonce, over budget,
+    /// unsolicited, oversize), cumulative.
+    pub vbc_directory_ae_refused: u64,
+    /// ForkSettlement wave 4a — verified entries in the witness directory now.
+    pub vbc_directory_entries: u64,
+    /// ForkSettlement wave 3 (§2.3 / §2.4) — the origin ledger, fork detection
+    /// / adoption and the attestation vouch. FLATTENED: every field reaches the
+    /// JSON top level under its own name. ONE builder (`NablaNode::
+    /// origin_status`) feeds both status builders (RULE 1).
+    #[serde(flatten)]
+    pub origin: OriginStatus,
     pub healthy: bool,
     pub health_issues: Vec<String>,
+}
+
+/// GUIDE §5.6a — one peer's observation of OUR source address.
+///
+/// The unanimity rule is `distinct(observed_ip) > 1 ⇒ disputed`, so seeing the
+/// distinct values and their reporters is what makes a demotion diagnosable:
+/// "alpha and beta say 172.20.0.61, theta says 60.250.239.116" is actionable;
+/// "2 distinct addresses from 3 peers" is not.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressObservation {
+    pub node_id_hex: String,
+    /// Peer's name where known — empty if we have no NBC for them yet.
+    pub node_name: String,
+    /// The source address THIS peer observed for us, rendered v4 where the
+    /// stored IPv6-mapped form permits.
+    pub observed_ip: String,
 }
 
 /// A mesh peer for the dashboard graph.
@@ -348,8 +945,57 @@ pub fn diagnose(status: &mut NodeStatusSnapshot) {
     if !status.cc_active {
         issues.push("CC chain not initialized".into());
     }
-    if status.tardis_active && status.tardis_slot == "E" {
-        issues.push("TARDIS slot: E (stateless enquiry only)".into());
+    // ── TARDIS attachment ──
+    //
+    // A node with no upstream is an ORPHAN. Per YPX-003 §1.1 and the tier
+    // discussion in §1.2.1, Orphan is "the only state that's actually a problem" —
+    // it receives no ticks, cannot approve a chain, and its SMT drifts away
+    // from the mesh.
+    //
+    // This check did not exist until 2026-08-01, and its absence is why a mesh
+    // with 8 of 10 nodes orphaned and THREE distinct SMT roots reported
+    // `healthy: true, issues: []` on every node. KI#46's fix plan called for
+    // exactly this ("a convergence gate + health metric so a wedged mesh can
+    // never again report healthy"); the gate shipped, the metric did not.
+    //
+    // Note what was here instead: a check for `tardis_slot == "E"`. E is the
+    // ENQUIRY slot — stateless connect/query/disconnect, entirely normal
+    // (§1.1). It was flagging the benign state and ignoring the fatal one. It
+    // also could never fire: `tardis_slot` is only ever emitted as
+    // "Writer" / "D{n}" / "Orphan" (nabla_node.rs), so no node ever reports E.
+    if status.tardis_active && !status.has_upstream {
+        issues.push(format!(
+            "TARDIS ORPHAN — no upstream (slot: {}); receives no ticks and its \
+             SMT will diverge",
+            status.tardis_slot,
+        ));
+    }
+    // ── KI#79: serve-gate arming ──
+    //
+    // A node that is not serving registrations is not healthy — flagged
+    // IMMEDIATELY, not after a grace window: a normal restart sits unarmed
+    // ~2 minutes and watchers already wait for [ARMED] after a roll, while
+    // a grace window is exactly the shape that let delta's 8-hour episode
+    // read `healthy: true` throughout (same blind-spot class as the orphan
+    // check above, and the precedent it documents).
+    if !status.anti_rollback_armed {
+        issues.push(format!(
+            "UNARMED — refusing all registrations ({} consecutive round(s), \
+             {} tick(s) so far)",
+            status.unarmed_rounds, status.unarmed_ticks,
+        ));
+    }
+    // GUIDE §5.6c lever 5 — the same blind spot as UNARMED: a node whose pool
+    // view is incomplete refuses every registration, and must not read
+    // `healthy: true` while it does.
+    if !status.pool_sync_gate_open {
+        issues.push(format!(
+            "POOL-SYNC-GATE CLOSED — refusing all registrations until every pool kind \
+             has synced (have {}/{}: {})",
+            status.pool_synced_kinds.len(),
+            crate::types::PoolKind::SERVE_GATE_KINDS.len(),
+            status.pool_synced_kinds.join(","),
+        ));
     }
 
     status.healthy = issues.is_empty();
@@ -415,6 +1061,10 @@ pub fn format_address(addr: &crate::types::NablaAddress) -> String {
                 .collect();
             format!("[{}]:{}", segs.join(":"), port)
         }
+        // Show the NAME as advertised — never the address it happens to resolve
+        // to here. This string is what an operator reads on /status, and
+        // resolving it for display would show one box's view of the peer.
+        crate::types::NablaAddress::Name { host, port } => format!("{host}:{port}"),
     }
 }
 
@@ -422,6 +1072,16 @@ pub fn format_address(addr: &crate::types::NablaAddress) -> String {
 
 /// Build JSON response body for /api/status or /status.
 pub fn json_status(status: &NodeStatusSnapshot) -> String {
+    // Dev-only flood chaos (feature `flood-chaos`, src/flood_chaos.rs): its counters and the
+    // watched wallets' BanTable evidence ride /status as `flood_chaos` — absent on every other
+    // build, which is how a gate tells "not built with it" from "built, suppressed nothing".
+    #[cfg(feature = "flood-chaos")]
+    {
+        if let Ok(serde_json::Value::Object(mut m)) = serde_json::to_value(status) {
+            m.insert("flood_chaos".into(), crate::flood_chaos::status_json());
+            return serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".into());
+        }
+    }
     serde_json::to_string_pretty(status).unwrap_or_else(|_| "{}".into())
 }
 
@@ -1260,8 +1920,215 @@ setInterval(update, 2000);
 mod tests {
     use super::*;
 
+    /// A served snapshot must be able to FAIL a freshness check.
+    ///
+    /// `/status` is served from a cache the refresher keeps warm; when that
+    /// refresher stops, the endpoint keeps answering with an ever-older
+    /// snapshot and every consumer reads it as live. That is what happened on
+    /// 2026-09-01 — zeta reported a 4509 s-old tick while its TARDIS was
+    /// current, and `driver.py tardis` turned it into a phantom 1000 s tick
+    /// spread and a second root_hash on a converged mesh. Visibility alone is
+    /// not enough: a check that cannot fail is not a check, so this asserts
+    /// staleness is DETECTABLE from the wire, not merely recorded.
+    #[test]
+    fn built_at_makes_staleness_detectable() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut fresh = make_status();
+        fresh.built_at = now;
+        let age = now.saturating_sub(fresh.built_at);
+        assert!(age <= 1, "a just-built snapshot must read as fresh, got {age}s");
+
+        // The failing direction is the one that matters: a refresher that
+        // died an hour ago must be visibly an hour old, not silently "live".
+        let mut stale = make_status();
+        stale.built_at = now - 3600;
+        let age = now.saturating_sub(stale.built_at);
+        assert!(
+            age >= 3600,
+            "a snapshot built an hour ago MUST be detectable as stale; \
+             if this ever reads fresh, /status has become unfalsifiable"
+        );
+
+        // And it must survive serialization — a consumer reads JSON, not the
+        // struct, so an unserialized field would restore the original lie.
+        let body = serde_json::to_string(&stale).expect("status serializes");
+        assert!(
+            body.contains("built_at"),
+            "built_at must reach the wire or consumers cannot judge freshness"
+        );
+    }
+
+    /// RULE 6 — the KI#205 claim counters are instruments: a consumer reads
+    /// JSON, not the struct, so both must reach the wire with the value set
+    /// (an unserialized counter restores "never ran" == "0 refusals").
+    #[test]
+    fn ki205_claim_counters_reach_the_wire() {
+        let mut s = make_status();
+        s.claims_unauthenticated = 7;
+        s.recalls_refused_claimed = 3;
+        let body = serde_json::to_string(&s).expect("status serializes");
+        assert!(body.contains("\"claims_unauthenticated\":7"), "claims_unauthenticated must reach the wire: {body}");
+        assert!(body.contains("\"recalls_refused_claimed\":3"), "recalls_refused_claimed must reach the wire: {body}");
+    }
+
+    /// RULE 6 — the ForkSettlement wave-2a instruments (refused legs, refused
+    /// snapshots) are read as JSON; both must reach the wire with their value.
+    #[test]
+    fn wave2a_leg_and_snapshot_counters_reach_the_wire() {
+        let mut s = make_status();
+        s.leg_preimage_refused = 5;
+        s.snapshot_decode_refused = 2;
+        s.witness_not_in_directory_refused = 4;
+        s.wal_checksum_missing_refused = 6;
+        s.declared_state_unanchored = 8;
+        let body = serde_json::to_string(&s).expect("status serializes");
+        assert!(body.contains("\"declared_state_unanchored\":8"), "KI#251 counter must reach the wire: {body}");
+        assert!(body.contains("\"witness_not_in_directory_refused\":4"), "KI#224 counter must reach the wire: {body}");
+        assert!(body.contains("\"wal_checksum_missing_refused\":6"), "KI#248 counter must reach the wire: {body}");
+        assert!(body.contains("\"leg_preimage_refused\":5"), "leg_preimage_refused must reach the wire: {body}");
+        assert!(body.contains("\"snapshot_decode_refused\":2"), "snapshot_decode_refused must reach the wire: {body}");
+    }
+
+    /// RULE 6 — the ForkSettlement wave-4a witness-directory instruments are
+    /// read as JSON; each must reach the wire with its value.
+    #[test]
+    fn wave4a_directory_counters_reach_the_wire() {
+        let mut s = make_status();
+        s.vbc_directory_refused = 3;
+        s.vbc_registry_decode_refused = 1;
+        s.vbc_directory_ae_refused = 4;
+        s.vbc_directory_entries = 9;
+        s.vbc_stamp_refused_no_floor = 6; // §6b.13 check 5
+        s.vbc_stamp_refused_held = 7; // §9r F-1(c)
+        s.vbc_stamp_refused_wait = 8;
+        let body = serde_json::to_string(&s).expect("status serializes");
+        for (k, v) in [("vbc_directory_refused", 3), ("vbc_registry_decode_refused", 1),
+                       ("vbc_directory_ae_refused", 4), ("vbc_directory_entries", 9),
+                       ("vbc_stamp_refused_no_floor", 6), ("vbc_stamp_refused_held", 7),
+                       ("vbc_stamp_refused_wait", 8)] {
+            assert!(body.contains(&format!("\"{k}\":{v}")), "{k} must reach the wire: {body}");
+        }
+    }
+
+    /// RULE 6 — every ForkSettlement wave-3 counter is read as JSON (the
+    /// struct is flattened); each must reach the TOP LEVEL of the wire with
+    /// its value. Mutation: drop `#[serde(flatten)]` → the keys nest under
+    /// `"origin"` and every assert here goes red.
+    #[test]
+    fn wave3_origin_counters_reach_the_wire() {
+        let mut s = make_status();
+        s.origin = OriginStatus {
+            origin_records: 101,
+            origin_records_contested: 102,
+            origin_records_created: 103,
+            origin_leg_unrecordable: 104,
+            redeem_records: 116,
+            redeem_records_contested: 117,
+            redeem_records_created: 118,
+            redeem_leg_zero_consumed: 119,
+            producer_binding_refused: 120,
+            wallet_id_key_mismatch: 121,
+            origin_fork_claims_detected: 105,
+            origin_fork_claims_adopted: 106,
+            fork_claims_applied: 107,
+            atraxi_evidence_refused: 108,
+            origin_fork_bans_rederived_at_load: 109,
+            origin_attest_vouched: 110,
+            origin_attest_withheld: 111,
+            origin_attest_held: 150,
+            provenance_states_derived: 122,
+            provenance_held_states: 123,
+            provenance_dirty_queue: 124,
+            fee_credits_held: 153,
+            fee_credits_parked: 154,
+            fee_credits_released: 155,
+            origin_boot_secs: 112,
+            origin_boot_refloors: 113,
+            ban_refused_malformed: 114,
+            wal_ban_decode_refused: 115,
+            ban_file_write_failed: 125,
+            record_ae_asks_sent: 126,
+            record_ae_answers_sent: 127,
+            record_ae_refused: 128,
+            record_ae_refused_unknown_sender: 129,
+            record_ae_refused_bad_signature: 130,
+            record_ae_refused_replayed_nonce: 131,
+            record_ae_refused_over_budget: 132,
+            record_ae_refused_unsolicited: 133,
+            record_ae_refused_oversize: 134,
+            record_ae_refused_malformed: 135,
+            record_ae_shed_global: 136,
+            record_ae_descents_completed: 137,
+            record_ae_descents_aborted: 138,
+            record_ae_descents_truncated: 139,
+            record_ae_legs_received: 140,
+            record_ae_legs_refused: 141,
+            record_ae_legs_recorded: 142,
+            record_ae_legs_ungraded: 143,
+            record_ae_legs_unrequested: 144,
+            origin_records_upgraded: 145,
+            record_trie_leaves: 146,
+            seqforkban_dropped: 147,
+            haladvance_dropped: 150,
+            taintalert_dropped: 151,
+            mergeresolved_dropped: 152,
+            ae_status_discarded: 148,
+            status_unbacked_at_load: 149,
+        };
+        let body = serde_json::to_string(&s).expect("status serializes");
+        for (k, v) in [
+            ("origin_records", 101), ("origin_records_contested", 102),
+            ("origin_records_created", 103), ("origin_leg_unrecordable", 104),
+            ("origin_fork_claims_detected", 105), ("origin_fork_claims_adopted", 106),
+            ("fork_claims_applied", 107), ("atraxi_evidence_refused", 108),
+            ("origin_fork_bans_rederived_at_load", 109), ("origin_attest_vouched", 110),
+            ("origin_attest_withheld", 111), ("origin_boot_secs", 112),
+            ("origin_boot_refloors", 113), ("ban_refused_malformed", 114),
+            ("wal_ban_decode_refused", 115),
+            ("redeem_records", 116), ("redeem_records_contested", 117),
+            ("redeem_records_created", 118), ("redeem_leg_zero_consumed", 119),
+            ("producer_binding_refused", 120), ("wallet_id_key_mismatch", 121),
+            ("provenance_states_derived", 122), ("provenance_held_states", 123),
+            ("provenance_dirty_queue", 124), ("ban_file_write_failed", 125),
+            ("record_ae_asks_sent", 126), ("record_ae_answers_sent", 127),
+            ("record_ae_refused", 128), ("record_ae_refused_unknown_sender", 129),
+            ("record_ae_refused_bad_signature", 130), ("record_ae_refused_replayed_nonce", 131),
+            ("record_ae_refused_over_budget", 132), ("record_ae_refused_unsolicited", 133),
+            ("record_ae_refused_oversize", 134), ("record_ae_refused_malformed", 135),
+            ("record_ae_shed_global", 136), ("record_ae_descents_completed", 137),
+            ("record_ae_descents_aborted", 138), ("record_ae_descents_truncated", 139),
+            ("record_ae_legs_received", 140), ("record_ae_legs_refused", 141),
+            ("record_ae_legs_recorded", 142), ("record_ae_legs_ungraded", 143),
+            ("record_ae_legs_unrequested", 144), ("origin_records_upgraded", 145),
+            ("record_trie_leaves", 146), ("seqforkban_dropped", 147), ("haladvance_dropped", 150),
+            ("ae_status_discarded", 148), ("status_unbacked_at_load", 149),
+            ("taintalert_dropped", 151), ("mergeresolved_dropped", 152),
+            ("origin_attest_held", 150),
+            ("fee_credits_held", 153), ("fee_credits_parked", 154), ("fee_credits_released", 155),
+        ] {
+            assert!(body.contains(&format!("\"{k}\":{v}")), "{k} must reach the wire top level: {body}");
+        }
+        assert!(!body.contains("\"origin\":{"), "flattened, not nested: {body}");
+    }
+
     fn make_status() -> NodeStatusSnapshot {
         let mut s = NodeStatusSnapshot {
+            address_disputed: false,
+            address_reports: 0,
+            slot_hints_dropped_unobserved: 0,
+            // §5.6a / NBC — this builder has no node handle in scope; the live
+            // values come from the nabla_node.rs snapshot builder.
+            address_observers: Vec::new(),
+            address_unroutable: false,
+            nbc_issued_at: 0,
+            nbc_expires_at: 0,
+            nbc_expires_in_secs: 0,
+            nbc_chain_depth: 0,
+            nbc_issuer: String::new(),
             version: format!("v{}", env!("CARGO_PKG_VERSION")),
             node_name: String::new(),
             node_id_hex: "aabbccdd11223344".into(),
@@ -1272,8 +2139,37 @@ mod tests {
             txid_bloom_count: 123,
             txid_bloom_bytes: 18_000_000,
             txid_bloom_fpr: 0.0001,
+            txid_bloom_fill_ratio: 0.0,
+            consumed_bloom_count: 0,
+            consumed_bloom_fpr: 0.0,
+            consumed_bloom_fill_ratio: 0.0,
             listen_addr: "[::]:1211".into(),
             wan_addr: None,
+            anti_rollback_armed: true,
+            unarmed_rounds: 0,
+            unarmed_ticks: 0,
+            same_seq_marks_manufactured: 0,
+            same_seq_marks_cleared: 0,
+            same_seq_marks_active: 0,
+            atraxi_open_keys: 0,
+            atraxi_claims_opened: 0,
+            atraxi_held_refusals: 0,
+            claims_unauthenticated: 0,
+            recalls_refused_claimed: 0,
+            leg_preimage_refused: 0,
+            witness_not_in_directory_refused: 0,
+            declared_state_unanchored: 0,
+            wal_checksum_missing_refused: 0,
+            snapshot_decode_refused: 0,
+            vbc_directory_refused: 0,
+            vbc_stamp_refused_no_floor: 0,
+            vbc_stamp_refused_held: 0,
+            vbc_stamp_refused_wait: 0,
+            vbc_registry_decode_refused: 0,
+            vbc_directory_ae_refused: 0,
+            vbc_directory_entries: 0,
+            origin: OriginStatus::default(),
+            built_at: 1_700_000_000,
             current_tick: 1000,
             tardis_active: true,
             tardis_slot: "D1".into(),
@@ -1284,6 +2180,28 @@ mod tests {
             d2_approved: false,
             ticks_with_current_parent: 0,
             rebalance_cooldown: 0,
+            orphan_causes: Default::default(),
+            lineage_ok: 0,
+            lineage_reject: 0,
+            lineage_skip: 0,
+            audit_exonerated: 0,
+            tardis_audit: Default::default(),
+            tickhash_verified: 0,
+            tickhash_unverified: 0,
+            alert_proven: 0,
+            alert_unproven: 0,
+            quarantine_withheld: 0,
+            ae_stall_windows: 0,
+            stake_lock_observed_not_own_claim: 0,
+            audit_resp_unauthorized: 0,
+            audit_resp_unmatched: 0,
+            poolsync_drop_unverified: 0,
+            approvals_unverified: 0,
+            alert_identity_proven: 0,
+            alert_identity_unproven: 0,
+            wal_deep_scan_corrupt: 0,
+            h3_unbuilt_dropped: 0,
+            ki222_banalert_dropped: 0,
             root_hash_hex: "0123456789abcdef".into(),
             entry_count: 5000,
             ban_count: 2,
@@ -1307,12 +2225,23 @@ mod tests {
             dev_pool_balance: crate::constants::DEV_TREASURY_POOL_INITIAL_ATOMS,
             dev_pool_claims: 3,
             dev_pool_local_claims: 1,
+            bootstrap_pool_balance: crate::constants::BOOTSTRAP_POOL_INITIAL_ATOMS,
+            bootstrap_pool_claims: 0,
+            foundation_pool_balance: crate::constants::FOUNDATION_BOOTSTRAP_POOL_INITIAL_ATOMS,
+            foundation_pool_claims: 0,
             deed_collected: 50000,
             deed_split: "30/70".into(),
             deed_pool_balance: 9_000_000_000,    // 0.9 AXC — demo only
             deed_pool_total_credited: 9_000_000_000,
             dev_deed_pool_balance: 0,
             dev_deed_pool_total_credited: 0,
+            fob_pools: Vec::new(),
+            fob_tranches_authored: 0,
+            fob_tranches_applied: 0,
+            fob_tranches_rejected: 0,
+            fob_conservation_rejects: 0,
+            emission_epoch: 0, emission_rolls: 0, emission_top_up_atoms: 0,
+            emission_claims_ok: 0, emission_claims_refused: 0, emission_conservation_refusals: 0,
             gossip_seen_count: 12345,
             last_gossip_tick: 998,
             transport_send_failures_total: 0,
@@ -1321,8 +2250,19 @@ mod tests {
             storm_dropped_total: 0,
             storm_trips_total: 0,
             tick_sig_failures: 0,
+            tardis_parked: false,
+            tardis_parked_grants: 0,
+            tardis_parked_to_seated: 0,
             quarantine_active_count: 0,
             quarantine_pending_count: 0,
+            emission_structural_violations: 0,
+            nbc_issued_this_epoch: 0,
+            nbc_issuance_refused_cap: 0,
+            nbc_issuer_over_cap_seen: 0,
+            probationary_peers: 0,
+            probation_refusals: 0,
+            pool_synced_kinds: vec![],
+            pool_sync_gate_open: true,
             penguin_score: 5500,
             penguin_level: "Penguin".into(),
             penguin_emoji: "\u{1F427}".into(),
@@ -1410,6 +2350,70 @@ mod tests {
         assert!(!s.healthy);
     }
 
+    /// KI#79 — an UNARMED node refuses every registration, so it must not
+    /// read healthy. delta was unarmed for 8 hours (2026-08-07) while
+    /// `healthy: true, issues: []` — armed state was not among the checked
+    /// conditions, the same blind-spot class the orphan check's comment
+    /// documents.
+    /// GUIDE §5.6c lever 5 — a closed pool-sync gate refuses every
+    /// registration exactly like UNARMED, so it must surface as an issue and
+    /// the field must survive JSON (consumers read the wire, not the struct).
+    #[test]
+    fn probation_pool_sync_gate_closed_is_a_health_issue() {
+        let mut s = make_status();
+        s.pool_sync_gate_open = false;
+        s.pool_synced_kinds = vec!["airdrop".into(), "deed".into()];
+        diagnose(&mut s);
+        assert!(!s.healthy, "a node refusing registrations must not report healthy");
+        assert!(
+            s.health_issues.iter().any(|i| i.contains("POOL-SYNC-GATE") && i.contains("2/8")),
+            "the issue must name the gate and the progress: {:?}", s.health_issues
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"pool_sync_gate_open\":false"));
+        assert!(json.contains("\"probationary_peers\""));
+        assert!(json.contains("\"probation_refusals\""));
+        // KI#191 residual + KI#48 P slot + §9.1.1a issuer cap: consumers read
+        // the wire, so every new counter must reach JSON.
+        for f in ["emission_structural_violations", "tardis_parked", "tardis_parked_grants",
+                  "tardis_parked_to_seated", "nbc_issued_this_epoch", "nbc_issuance_refused_cap",
+                  "nbc_issuer_over_cap_seen"] {
+            assert!(json.contains(&format!("\"{f}\"")), "/status must carry {f}");
+        }
+
+        let mut open = make_status();
+        open.pool_sync_gate_open = true;
+        diagnose(&mut open);
+        assert!(!open.health_issues.iter().any(|i| i.contains("POOL-SYNC-GATE")),
+            "an open gate is not an issue");
+    }
+
+    #[test]
+    fn ki79_unarmed_is_a_health_issue() {
+        let mut s = make_status();
+        s.anti_rollback_armed = false;
+        s.unarmed_rounds = 5760; // 8 hours at one round per 5s tick
+        s.unarmed_ticks = 28_800;
+        diagnose(&mut s);
+
+        assert!(!s.healthy, "an unarmed node must not report healthy");
+        assert!(
+            s.health_issues.iter().any(|i| i.contains("UNARMED")),
+            "the issue must name the condition: {:?}", s.health_issues
+        );
+        // And the counters that separate a livelock from a startup delay
+        // must be IN the message — that is the whole point of KI#79.
+        assert!(s.health_issues.iter().any(|i| i.contains("5760")));
+    }
+
+    /// KI#79 — armed is the healthy default (the fixture is armed).
+    #[test]
+    fn ki79_armed_produces_no_unarmed_issue() {
+        let mut s = make_status();
+        diagnose(&mut s);
+        assert!(!s.health_issues.iter().any(|i| i.contains("UNARMED")));
+    }
+
     // ── Routing ──
 
     #[test]
@@ -1421,6 +2425,21 @@ mod tests {
         assert_eq!(code, 200);
         assert!(content_type.contains("html"));
         assert!(body.contains("AXIOM Nabla"));
+    }
+
+    /// Nabla has no functional HTTP (YP "Transport — functional endpoints",
+    /// amended 2026-09-26): each former functional path is simply not a
+    /// dashboard route and answers 404 — no handler, no 410 gate.
+    #[test]
+    fn former_functional_paths_are_not_routes() {
+        let status = make_status();
+        let config = MonitorConfig::default();
+        for path in ["/register", "/clara", "/query", "/query-txid", "/register-cheque-claim",
+                     "/query-cheque-claim", "/pulse-proof", "/jfp-secret", "/jfp-secrets",
+                     "/bridge", "/endorse-ban-challenge", "/challenge-ban"] {
+            let (code, _, _) = route_request(path, None, &status, &config);
+            assert_eq!(code, 404, "{path} must not be a dashboard route");
+        }
     }
 
     #[test]

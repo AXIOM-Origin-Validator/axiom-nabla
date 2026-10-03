@@ -152,21 +152,166 @@ pub fn approval_sign_payload(approval: &TickApproval) -> Vec<u8> {
 
 /// Canonical payload for a SubtreeAuditResponse signature.
 pub fn audit_response_sign_payload(response: &SubtreeAuditResponse) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64 + 32 + 8 + 32);
+    // KI#48 follow-up: subtree_hash + siblings are now covered — pre-fix the
+    // signature bound only prefix/root/tick/pk, so the actual audit ANSWER
+    // was unsigned and could be tampered in flight without detection.
+    let mut buf =
+        Vec::with_capacity(response.prefix.len() + 32 + 32 + 8 + 32 + response.siblings.len() * 32);
     buf.extend_from_slice(&response.prefix);
+    buf.extend_from_slice(&response.subtree_hash);
     buf.extend_from_slice(&response.root_hash);
     buf.extend_from_slice(&response.response_tick.to_le_bytes());
     buf.extend_from_slice(&response.responder_pk);
+    for sib in &response.siblings {
+        buf.extend_from_slice(sib);
+    }
     buf
 }
 
+/// Verify that a QuestionableAlert's evidence actually PROVES the accusation.
+///
+/// The alert's own signature proves only WHO accused. This checks the suspect's
+/// own signed statements, so a receiver never has to trust the reporter.
+///
+/// `suspect_key` is the suspect's NBC-anchored Ed25519 key. Returns the reason
+/// it proves the accusation, or `None` if it proves nothing.
+pub fn verify_questionable_evidence(
+    ev: &QuestionableEvidence,
+    suspect_pk: &[u8; 32],
+    suspect_key: &[u8],
+    verify: &dyn Fn(&[u8], &[u8], &[u8]) -> bool,
+) -> Option<&'static str> {
+    // The audit answer must be signed BY THE SUSPECT — otherwise the reporter
+    // could have fabricated it.
+    if ev.audit_response.responder_pk != *suspect_pk {
+        return None;
+    }
+    if !verify(
+        suspect_key,
+        &audit_response_sign_payload(&ev.audit_response),
+        &ev.audit_response.signature,
+    ) {
+        return None;
+    }
+
+    match &ev.advertised_root {
+        // Claim: SELF-CONTRADICTION. Needs the suspect's signed advertisement
+        // for the same tick, and the two roots must actually differ.
+        Some(adv) => {
+            if !verify(
+                suspect_key,
+                &tickhash_sign_payload(ev.audit_response.response_tick, adv, suspect_pk),
+                &ev.advertised_sig,
+            ) {
+                return None;
+            }
+            if *adv == ev.audit_response.root_hash {
+                return None; // no contradiction — the accusation is empty
+            }
+            Some("self_contradiction")
+        }
+        // Claim: the answer refutes itself. Re-run the merkle fold; if it
+        // reconstructs, there is no defect and the accusation is empty.
+        None => {
+            let ok = crate::smt::SparseMerkleTree::verify_subtree_proof(
+                &ev.audit_response.root_hash,
+                &ev.audit_response.prefix,
+                &ev.audit_response.subtree_hash,
+                &ev.audit_response.siblings,
+            );
+            if ok { None } else { Some("proof_does_not_reconstruct") }
+        }
+    }
+}
+
+/// Commitment over a `QuestionableEvidence`, for `QuestionableAlert.evidence_hash`.
+///
+/// Binds the suspect's two signed statements so the alert signature covers the
+/// proof, not just the accusation. Domain-tagged.
+pub fn evidence_commitment(ev: &QuestionableEvidence) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"AXIOM_QALERT_EVIDENCE_v1");
+    h.update(&audit_response_sign_payload(&ev.audit_response));
+    h.update(&ev.audit_response.signature);
+    match &ev.advertised_root {
+        Some(r) => {
+            h.update(&[1u8]);
+            h.update(r);
+        }
+        None => {
+            h.update(&[0u8]);
+        }
+    }
+    h.update(&(ev.advertised_sig.len() as u32).to_le_bytes());
+    h.update(&ev.advertised_sig);
+    *h.finalize().as_bytes()
+}
+
 /// Canonical payload for a QuestionableAlert signature.
+/// Canonical payload for a `GossipMessage::TickHash` signature.
+///
+/// Binds the advertisement to (tick, root, advertiser) so it cannot be replayed
+/// onto another tick or attributed to another node. Domain-tagged so a TickHash
+/// signature can never be mistaken for a tick or alert signature.
+pub fn tickhash_sign_payload(tick: u64, root_hash: &[u8; 32], node_pk: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + 8 + 32 + 32);
+    buf.extend_from_slice(b"AXIOM_TICKHASH_v1");
+    buf.extend_from_slice(&tick.to_le_bytes());
+    buf.extend_from_slice(root_hash);
+    buf.extend_from_slice(node_pk);
+    buf
+}
+
 pub fn alert_sign_payload(alert: &QuestionableAlert) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + 32 + 8 + 32);
     buf.extend_from_slice(&alert.suspect_pk);
     buf.extend_from_slice(&alert.reporter_pk);
     buf.extend_from_slice(&alert.tick.to_le_bytes());
     buf.extend_from_slice(&alert.evidence_hash);
+    buf
+}
+
+/// Canonical payload for a `GossipMessage::Alert`'s per-hop signature
+/// (`AXIOM_DESIGN_NablaPoolCaps.md` §5.6.4 step 1, KI#72).
+///
+/// §5.6.4 requires the receiver to "verify `alert.intermediate_emitter` == P
+/// (NBC-bound TCP identity)", and the §5.6.5 dual-uniqueness argument rests
+/// entirely on it — A1/A6/A7 are each defended by "intermediate = self,
+/// TCP-source-verified". No such transport identity exists: `Envelope` carries
+/// only a `SocketAddr` and there is no NBC handshake, so the field was whatever
+/// the sender wrote and the check compared it to itself.
+///
+/// Rather than build a connection handshake, this reuses the KI#18/19/20
+/// pattern already used for ticks, audit responses and approvals: **nothing new
+/// travels except a 64-byte signature.** The forwarding node signs this payload
+/// with its NBC-bound Ed25519 key; the receiver looks that key up in its OWN
+/// `verified_nbcs[intermediate_emitter]` (warm from the KI#32 snapshot) and
+/// verifies. The NBC itself is never sent.
+///
+/// Binds every field a forwarder could otherwise tamper with:
+///   - `intermediate_emitter` — so a peer cannot claim to be someone else
+///     (§5.6.7 A6); the signature only verifies against the named node's key.
+///   - `origin_emitter` + `accused` + `alert_type` — the accusation itself.
+///   - a hash of `evidence` — so a forwarder cannot substitute evidence
+///     (§3.5.2 evidence-pool binding) without invalidating the signature.
+///   - `emitted_at_tick` — pins the 10-tick dedup/consensus window.
+pub fn pool_alert_sign_payload(
+    alert_type: u8,
+    accused: &[u8; 32],
+    evidence: &[u8],
+    origin_emitter: &[u8; 32],
+    intermediate_emitter: &[u8; 32],
+    emitted_at_tick: u64,
+) -> Vec<u8> {
+    let evidence_hash = blake3::hash(evidence);
+    let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 8);
+    buf.extend_from_slice(b"AXIOM_POOL_ALERT_v1");
+    buf.push(alert_type);
+    buf.extend_from_slice(accused);
+    buf.extend_from_slice(evidence_hash.as_bytes());
+    buf.extend_from_slice(origin_emitter);
+    buf.extend_from_slice(intermediate_emitter);
+    buf.extend_from_slice(&emitted_at_tick.to_le_bytes());
     buf
 }
 
@@ -183,16 +328,60 @@ pub fn pool_sync_sign_payload(
     pool_byte: u8,
     balance: u64,
     total_claims: u64,
+    // KI#191 — the conservation terms are SIGNED. A receiver decides whether a
+    // peer is structurally violating from these numbers, so unsigned they would
+    // be an attacker's lever on JUDOON's verdict — a new security surface in
+    // the middle of the mechanism meant to remove one.
+    paid_out: u64,
+    topped_up: u64,
     tick: u64,
     sender_node_id: &[u8; 32],
+    // BoundedFee pools share the `pool_byte` 0x05, so the `(validator_id,
+    // is_dev)` is appended here (and ONLY here) to bind which pool AND which
+    // CLASS the sig covers — a sig for one validator's pool or class cannot be
+    // replayed onto another. `None` for the singleton pools → their payload is
+    // byte-identical to before, so existing Airdrop/Deed signatures keep
+    // verifying (same append-suffix discipline as the OODS baseline binding).
+    bounded_fee_key: Option<([u8; 32], bool)>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(18 + 1 + 8 + 8 + 8 + 32);
+    let mut buf = Vec::with_capacity(18 + 1 + 8 + 8 + 8 + 8 + 8 + 32 + 32 + 1);
     buf.extend_from_slice(b"AXIOM_POOL_SYNC_v1");
     buf.push(pool_byte);
     buf.extend_from_slice(&balance.to_le_bytes());
     buf.extend_from_slice(&total_claims.to_le_bytes());
+    buf.extend_from_slice(&paid_out.to_le_bytes());
+    buf.extend_from_slice(&topped_up.to_le_bytes());
     buf.extend_from_slice(&tick.to_le_bytes());
     buf.extend_from_slice(sender_node_id);
+    if let Some((vid, is_dev)) = bounded_fee_key {
+        buf.extend_from_slice(&vid);
+        buf.push(is_dev as u8);
+    }
+    buf
+}
+
+/// ForkSettlement R50 (wave 4a) / §9o [R59] (W1) — THE canonical payload for
+/// every SIGNED AE message: the witness directory's (`VbcRegistrationDigest`
+/// request, kind 1 / `VbcRegistrationEntries` reply, kind 2) and record-AE's
+/// (`RecordAeAsk`, kind 3 / `RecordAeAnswer`, kind 4 — `record_sync::
+/// RECORD_AE_KIND_*`). The PoolSync pattern: the sender signs with its node
+/// key; the receiver verifies against the Ed25519 key in `verified_nbcs[from]`.
+/// `from`, the per-round `nonce` and the BODY (as `body_hash` —
+/// `vbc_directory::have_body_hash` / `entries_body_hash`, `record_sync::
+/// ask_body_hash` / `answer_body_hash`) are all inside the signature, and
+/// `kind` separates request from reply AND protocol from protocol, so none
+/// can be replayed as another. ~~`vbc_directory_ae_sign_payload`~~ — renamed
+/// 2026-09-30 when record-AE became its second user (ONE builder, RULE 1). The
+/// domain tag keeps its historical bytes `AXIOM_VBC_DIRECTORY_AE` on purpose:
+/// changing it would break the directory AE between rolled and unrolled nodes
+/// for no security gain (the kind byte is the separator).
+pub fn ae_sign_payload(kind: u8, from: &[u8; 32], nonce: u64, body_hash: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(22 + 1 + 32 + 8 + 32);
+    buf.extend_from_slice(b"AXIOM_VBC_DIRECTORY_AE");
+    buf.push(kind);
+    buf.extend_from_slice(from);
+    buf.extend_from_slice(&nonce.to_le_bytes());
+    buf.extend_from_slice(body_hash);
     buf
 }
 
@@ -238,6 +427,28 @@ pub fn response_sign_payload(resp: &NablaResponse) -> Vec<u8> {
     buf
 }
 
+/// YP §25 domain table / GUIDE_Nabla §5.6 — the NBC-renewal signing digest:
+/// `BLAKE3("AXIOM_NBC_RENEW" ‖ validator_id ‖ request_time_le)`.
+///
+/// KI#55 (Pattern 1): ONE builder for the requester's signature
+/// (`nabla_node.rs::check_nbc_renewal`) and the issuer's verify
+/// (`handle_nbc_renewal_request`). They were two inline copies; a drift in
+/// either silently refuses every renewal ("renewal signature invalid") until the
+/// NBC expires. Guarded by the Python-computed KAT in
+/// `tests::ki55_nbc_renew_kat` and the bin's `ki55_anchor` tests.
+pub fn nbc_renew_sign_payload(validator_id: &[u8; 32], request_time: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"AXIOM_NBC_RENEW");
+    hasher.update(validator_id);
+    hasher.update(&request_time.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+// (KI#247, owner ruling 2026-10-02: `role_attestation_sign_payload` — the
+// `AXIOM_NABLA_ROLE` builder — was DELETED with both of its signers. Nothing in
+// the tree verified the signature: a signature nobody checks is a ghost
+// (RULE 3). The query reply's `role` remains, unsigned and informational.)
+
 // NBC: All cryptographic operations (signing commitment, signing, verification)
 // are done by Core via execute(PublicInputs) → PublicOutputs.
 // Same verification path as VBC. Nabla never does NBC crypto.
@@ -271,7 +482,7 @@ pub fn cc_sign_payload(
 /// `current_tick > committed_at_tick` so a receiver cannot redeem
 /// in the same tick the sender's commit landed.  See YP §17.10.5.3.
 ///
-/// Domain: BLAKE3("AXIOM_FACT_CONFIRM_V2"
+/// Domain: BLAKE3("AXIOM_FACT_CONFIRM"
 ///                || tx_hash
 ///                || new_state
 ///                || committed_at_tick.to_le_bytes())
@@ -279,25 +490,12 @@ pub fn cc_sign_payload(
 ///
 /// Used by BOTH TCP (registration.rs) and HTTP (nabla_node.rs) paths.
 /// Core's matching recompute lives in `core/logic/src/fact.rs::verify_fact_link`.
-pub fn fact_confirm_payload(
-    old_state: &StateId,
-    new_state: &StateId,
-    committed_at_tick: u64,
-) -> [u8; 32] {
-    let tx_hash = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"AXIOM_TXHASH");
-        h.update(old_state);
-        h.update(new_state);
-        *h.finalize().as_bytes()
-    };
-    let mut h = blake3::Hasher::new();
-    h.update(b"AXIOM_FACT_CONFIRM_V2");
-    h.update(&tx_hash);
-    h.update(new_state);
-    h.update(&committed_at_tick.to_le_bytes());
-    *h.finalize().as_bytes()
-}
+// Pattern 1 sweep — ONE builder, owned by Core. This function used to
+// assemble `AXIOM_TXHASH` and `AXIOM_FACT_CONFIRM` independently of
+// `core/logic/src/fact.rs::verify_nabla_confirmation`, which verifies what we
+// sign. Re-exported through `registration.rs` because the crypto-boundary
+// tripwire forbids a fifth exempt file.
+pub use crate::registration::{fact_confirm_payload, fact_tx_hash};
 
 /// Canonical payload for a k=3 receipt witness signature.
 ///
@@ -450,6 +648,66 @@ impl Signer for NoopSigner {
 
 #[cfg(test)]
 mod tests {
+
+    // ── KI#55 KATs — constants computed in Python (`blake3`) from the YP layouts
+    // (scratchpad kat.py, ts = 1774070000), NOT from this crate. ──
+
+    /// MUTATION (run 2026-10-02): drop `request_time` from the builder ⇒ red.
+    #[test]
+    fn ki55_nbc_renew_kat() {
+        assert_eq!(hex::encode(super::nbc_renew_sign_payload(&[0xAB; 32], 1774070000)),
+            "9b4781dd94490861ac7c9bc91996764ebb635243fa30c96f4e25cd23f5ef86e9");
+    }
+
+    /// KI#72 — the per-hop Alert signature must bind WHO is forwarding.
+    ///
+    /// §5.6.5's dual-uniqueness argument assumes an attacker's alerts always
+    /// carry `intermediate = self`. That only holds if a signature for node A
+    /// cannot be presented as node B's. The payload therefore binds
+    /// `intermediate_emitter`, so the receiver's verify — which uses the key of
+    /// the node the packet NAMES — fails for anyone else (§5.6.7 A6).
+    #[test]
+    fn ki72_alert_payload_binds_the_forwarding_identity() {
+        let accused = [0xAA; 32];
+        let origin = [0xB0; 32];
+        let a = [0x0A; 32];
+        let b = [0x0B; 32];
+        let ev = b"pool-sync-evidence".to_vec();
+
+        let as_a = pool_alert_sign_payload(1, &accused, &ev, &origin, &a, 100);
+        let as_b = pool_alert_sign_payload(1, &accused, &ev, &origin, &b, 100);
+        assert_ne!(as_a, as_b,
+            "KI#72: the payload MUST depend on intermediate_emitter — otherwise a \
+             signature made by one node verifies for another, and a single \
+             attacker can supply every 'distinct intermediate' the quorum counts");
+
+        // Same node, same everything → stable (a forwarder can re-sign
+        // deterministically, and a replay of OUR OWN hop is caught by dedup,
+        // not by signature churn).
+        assert_eq!(as_a, pool_alert_sign_payload(1, &accused, &ev, &origin, &a, 100));
+    }
+
+    /// The payload must bind the evidence, the accusation and the tick, so a
+    /// forwarder cannot swap any of them while keeping a valid signature.
+    #[test]
+    fn ki72_alert_payload_binds_evidence_accusation_and_tick() {
+        let accused = [0xAA; 32];
+        let origin = [0xB0; 32];
+        let inter = [0x0A; 32];
+        let ev = b"real-evidence".to_vec();
+        let base = pool_alert_sign_payload(1, &accused, &ev, &origin, &inter, 100);
+
+        assert_ne!(base, pool_alert_sign_payload(1, &accused, b"swapped", &origin, &inter, 100),
+            "evidence must be bound (§3.5.2 evidence-pool binding)");
+        assert_ne!(base, pool_alert_sign_payload(1, &[0xCC; 32], &ev, &origin, &inter, 100),
+            "the accused must be bound");
+        assert_ne!(base, pool_alert_sign_payload(1, &accused, &ev, &[0xC0; 32], &inter, 100),
+            "origin_emitter must be bound");
+        assert_ne!(base, pool_alert_sign_payload(1, &accused, &ev, &origin, &inter, 101),
+            "emitted_at_tick must be bound — it pins the 10-tick consensus window");
+        assert_ne!(base, pool_alert_sign_payload(2, &accused, &ev, &origin, &inter, 100),
+            "alert_type must be bound");
+    }
     use super::*;
 
     #[test]

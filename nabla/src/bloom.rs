@@ -169,6 +169,24 @@ impl TxidBloomFilter {
     /// Merge another bloom filter into this one (bitwise OR).
     /// Used when syncing from a hashmap peer's exported bloom.
     /// Both filters must have the same size.
+    /// Test-only: saturate every bit, to model a peer offering a poisoned filter.
+    #[cfg(test)]
+    pub fn set_all_bits_for_test(&mut self) {
+        for b in self.bits.iter_mut() {
+            *b = 0xFF;
+        }
+    }
+
+    /// Fraction of bits set (0.0–1.0). Used to sanity-check a filter offered by a
+    /// peer before adopting it — see `MAX_ADOPTABLE_BIT_DENSITY`.
+    pub fn bit_density(&self) -> f64 {
+        if self.bits.is_empty() {
+            return 0.0;
+        }
+        let set: u32 = self.bits.iter().map(|b| b.count_ones()).sum();
+        set as f64 / (self.bits.len() as f64 * 8.0)
+    }
+
     pub fn merge(&mut self, other: &TxidBloomFilter) -> Result<(), String> {
         if self.bits.len() != other.bits.len() {
             return Err(format!(
@@ -232,6 +250,23 @@ pub const SCORE_TXID_HASHMAP_MULTIPLIER: u64 = 5;
 
 /// Default bloom filter size: 10M expected txids (~18MB on disk).
 pub const DEFAULT_BLOOM_EXPECTED_ITEMS: u64 = 10_000_000;
+
+/// Maximum bit density we will ADOPT from a peer (KI#42).
+///
+/// `merge` validates only that dimensions match, then ORs the bits — and union is
+/// permanent, since nothing ever clears a bloom. So a peer offering a heavily-set
+/// filter permanently poisons the receiver: `is_state_consumed` starts answering
+/// "yes" to everything, and because that gate FAILS CLOSED the node then rejects
+/// every legitimate registration as a replay. Unrecoverable without wiping state.
+/// The existing comment "an attacker peer's empty/forged view can't disarm us" is
+/// true but covers only one direction — a hostile peer cannot disarm us, it can
+/// OVER-arm us.
+///
+/// 0.80 is chosen so the guard costs nothing real: at k=10 a filter is ~50% set at
+/// its design capacity and ~75% at twice it, and past ~80% its false-positive rate
+/// exceeds ~10% — such a filter is not worth adopting anyway, because all it can
+/// contribute is false positives. Refusing it loses no legitimate information.
+pub const MAX_ADOPTABLE_BIT_DENSITY: f64 = 0.80;
 
 // ════════════════════════════════════════════════════════════════════════
 // Tests

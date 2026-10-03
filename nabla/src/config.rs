@@ -171,17 +171,15 @@ fn parse_toml_string_field(line: &str, field: &str) -> Option<String> {
 /// Returns the address string without quotes, or None if not matching.
 fn parse_toml_address_line(line: &str) -> Option<String> {
     let line = line.trim();
-    // Match: address = "..."
-    if let Some(rest) = line.strip_prefix("address") {
-        let rest = rest.trim();
-        if let Some(rest) = rest.strip_prefix('=') {
-            let rest = rest.trim();
-            if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-                return Some(rest[1..rest.len()-1].to_string());
-            }
-        }
-    }
-    None
+    // Match: address = "..."  — extract the QUOTED value only, ignoring anything
+    // after the closing quote (e.g. a trailing `# comment`). The previous version
+    // required the line to *end* with `"`, so `address = "host:port"  # note`
+    // failed to parse and the whole bootstrap list was silently dropped.
+    let rest = line.strip_prefix("address")?.trim();
+    let rest = rest.strip_prefix('=')?.trim();
+    let rest = rest.strip_prefix('"')?; // opening quote
+    let end = rest.find('"')?; // closing quote; trailing text (comments) ignored
+    Some(rest[..end].to_string())
 }
 
 /// Parse an address string like "1.2.3.4:6225", "[2001:db8::1]:6225",
@@ -374,13 +372,27 @@ mod tests {
             NablaAddress::V6 { port, .. } => {
                 assert_eq!(*port, 6225);
             }
+            // A BOOTSTRAP entry is this node's own config, so it is resolved
+            // here, in this node's context — that is the correct place to
+            // resolve it. Only a peer's ADVERTISED address stays a Name, and
+            // that never comes through parse_address.
+            NablaAddress::Name { .. } => {
+                panic!("parse_address must resolve a bootstrap entry locally, got a Name")
+            }
         }
     }
 
+    /// GUIDE §5.6c — the probation register is a tick COUNT, projected ONCE
+    /// onto unix seconds. Both twins pinned so a register edit is a visible
+    /// decision, not drift: 34,560 ticks = 48 h; dev 60 ticks = 5 min.
     #[test]
-    fn probation_constant() {
-        use crate::constants::NABLA_PROBATION_SECS;
-        assert_eq!(NABLA_PROBATION_SECS, 48 * 3600,
-            "probation must be 48 hours in seconds");
+    fn probation_register_is_a_projected_tick_count() {
+        use crate::constants::{nabla_probation_span_secs, NABLA_PROBATION_TICKS, TICK_INTERVAL_SECS};
+        assert_eq!(nabla_probation_span_secs(), NABLA_PROBATION_TICKS * TICK_INTERVAL_SECS,
+            "the span must be the count projected by the tick interval — nothing else");
+        #[cfg(feature = "dev-tuning")]
+        assert_eq!(NABLA_PROBATION_TICKS, 60, "dev twin: 5 min at 5 s/tick (§5.6c)");
+        #[cfg(not(feature = "dev-tuning"))]
+        assert_eq!(nabla_probation_span_secs(), 48 * 3600, "release: 48 h (§5.6c)");
     }
 }

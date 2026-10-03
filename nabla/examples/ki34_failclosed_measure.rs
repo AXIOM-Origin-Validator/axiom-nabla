@@ -1,3 +1,9 @@
+// ⚠ RETIRED PATH (2026-09-30, Fork Settlement §9q, design B2 — docs/AXIOM_DESIGN_ForkSettlement.md):
+// this harness drives the KI#34 check-3 / YPX-025 E3 `HalAdvance` arm, which is now a TOMBSTONE — a node of
+// this build DROPS every `HalAdvance` unverified (counted `haladvance_dropped` on /status) and never freezes
+// on it. A HAL re-anchor floods as a plain `StateUpdate` with its leg and a revival is BANNED on A1 evidence.
+// Its assertions (freeze / freeze-race / shed) describe the retired behaviour; kept compiling as history.
+// The in-process proofs of the replacement are `fork_detection_mesh::b2_*`.
 // KI#34 T2.6 — fail-closed receiver, consultation-WIDTH measurement (no special node).
 //
 // `ki34_wi4_race` showed an OPTIMISTIC receiver (accept on >=2 nodes serving the
@@ -84,6 +90,8 @@ fn view_of(addr: &str, wallet: &B32, xp: &B32) -> View {
 fn state_update(w: &B32, new: &B32, tick: u64) -> WireMessage {
     let mut tx = *w; tx[31] = (tick & 0xff) as u8;
     WireMessage::Gossip(GossipMessage::StateUpdate {
+        old_state: [0u8; 32],
+        is_genesis_claim: false,
         wallet_id: *w, new_state: *new, tx_hash: tx, tick,
         wallet_seq: 0, seq_proof: None, client_pk: [0u8; 32],
         client_sig: vec![0u8; 64], amount: 0, fee_breakdown: Vec::new(),
@@ -106,6 +114,7 @@ fn hal_advance(w: &B32, old: &B32, new: &B32, tick: u64) -> WireMessage {
         wallet_id: *w, old_state: *old, new_state: *new, tx_hash: tx, tick,
         client_pk: [0u8; 32], client_sig: vec![0u8; 64], k3_signatures: sigs,
         amount: 0, fee_breakdown: Vec::new(),
+        required_k: 3, // KI#150 wire field (LAST)
     })
 }
 

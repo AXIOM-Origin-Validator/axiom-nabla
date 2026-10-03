@@ -55,6 +55,14 @@ pub mod constants;
 /// per `docs/AXIOM_DESIGN_NablaJudoon.md`.
 pub mod judoon;
 
+/// FOB (Fixed Outflow Balance) — Bounded Pools value-logic core: the two-state
+/// pool, the pure tranche function, mover sortition + the §5 eligibility gate.
+/// Self-contained + native-tested (Phase 1a); wiring into PoolKind/PoolSync is
+/// Phase 1b–d. Design `docs/AXIOM_DESIGN_BoundedPools.md`, model
+/// `docs/models/fob_bounded_pools/`.
+pub mod fob;
+pub mod emission;
+
 /// TARDIS: tick authority, approval chain, tree topology, recovery,
 /// rotation, rebalancing. ALL tree-level protocol decisions live here.
 pub mod tardis;
@@ -68,6 +76,9 @@ pub mod gossip;
 
 /// Sparse Merkle Tree: wallet state verification.
 pub mod smt;
+
+/// KI#43a — exact consumed-state record (per-era append-only files).
+pub mod consumed_exact;
 
 /// Write-ahead log: crash recovery for SMT operations.
 pub mod wal;
@@ -90,8 +101,26 @@ pub mod wire_client;
 /// Ban detection: conflicting state detection and evidence propagation.
 pub mod ban;
 
+// Fork Settlement W7c/W7d (minimal) — the derived provenance verdict behind
+// `NablaNode::origin_vouch` and `RegistrationAck.provenance`.
+pub mod provenance;
+
+/// Fork Settlement §9o [R58/R59] (W1) — R48 record-AE: the record trie, the
+/// receiver-driven descent, the R51 walk and the R50 session.
+pub mod record_sync;
+
+// Dev-only live-gate switch (ForkSettlement §9o proof obligations, KI#235/#236): feature
+// `flood-chaos` (dev build only — scripts/check_flood_chaos_dev_only.sh) + this crate's tests.
+#[cfg(any(test, feature = "flood-chaos"))]
+pub mod flood_chaos;
+
 /// Nabla node: orchestrates protocol components for a single node.
 pub mod node;
+/// ForkSettlement wave 4a (R42/R50) — the self-proving validator witness
+/// directory (KI#170 registry verified; KI#223 fixed).
+pub mod vbc_directory;
+/// KI#182 — THE list of what a node persists under its data dir (wipe / retain set).
+pub mod persistence;
 
 /// Configuration: runtime config loading from file.
 pub mod config;
@@ -139,6 +168,9 @@ pub mod bloom_era;
 /// Used by both the txid chain and the garbage state chain.
 pub mod bloom_chain;
 
+/// YPX-025 — ATRAXI: the Nabla hold/ban index (claims open + close on evidence).
+pub mod atraxi;
+
 /// YPX-018 §3.1, §3.3 — Bloom Age Index. Directory of every bloom era this
 /// node knows about (txid + garbage chain metadata side-by-side).
 pub mod age_index;
@@ -174,6 +206,13 @@ pub mod sim;
 /// Used by nabla-sim --mode=binary.
 #[doc(hidden)]
 pub mod binary_sim;
+
+/// ForkSettlement §7 — in-process multi-node fork-detection gate: N real
+/// `NablaNode`s, a router calling the binary's own lib entry points, shed /
+/// delay / crash / restart adversary. Test-only (the leg builder is
+/// `#[cfg(test)]`).
+#[cfg(test)]
+mod fork_detection_mesh;
 
 // ── Core Integration ──
 // All cryptographic operations go through crypto::Signer trait.

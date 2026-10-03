@@ -55,16 +55,57 @@ pub fn nbc_node_id(nbc: &NBC) -> NodeId {
     nbc.validator_id
 }
 
-/// Peer trust record — stored alongside cached NBC for join protocol.
+/// GUIDE §5.6c (KI#75, ruled 2026-09-25) — THE join-probation predicate.
+/// Every lever calls this (RULE 1): TARDIS attach refusal + upstream
+/// candidate skip, the OODS baseline, the Nabla emission claim, the Alert
+/// gate, and `/status`'s `probationary_peers`.
 ///
-/// Tracks the trust status of each verified peer: Genesis nodes bypass
-/// probation, new nodes enter Probation for NABLA_PROBATION_SECS,
-/// confirmed nodes are fully trusted.
+/// A certificate is probationary while it is a citizen NBC (`chain_depth !=
+/// 0`; genesis is exempt) AND younger than `nabla_probation_ticks`. The
+/// judgement uses ONLY the signed certificate's `issued_at` — verified on
+/// every hop, so network-attested — never a local "joined at" clock: a
+/// re-join, a peer hop or a restart cannot reset it, and expiry needs no
+/// promotion message (each peer recomputes it per tick).
+///
+/// Units: `issued_at` and `now_tick` are tick VALUES (unix seconds, KI#47);
+/// the register is a tick COUNT, projected once by
+/// `nabla_probation_span_secs` (KI#40/#165 class).
+pub fn is_probationary(nbc: &NBC, now_tick: u64) -> bool {
+    nbc.chain_depth != 0 && now_tick < probation_ends_at(nbc)
+}
+
+/// The tick VALUE (unix seconds) at which `nbc` leaves probation:
+/// `issued_at + projected window`. For a genesis certificate this is
+/// still computed (the caller decides exemption via `is_probationary`);
+/// reported to a joiner as `probation_until`.
+pub fn probation_ends_at(nbc: &NBC) -> u64 {
+    nbc.issued_at.saturating_add(nabla_probation_span_secs())
+}
+
+/// Peer trust record — the cached NBC of a peer that completed the join
+/// protocol, plus the wallet it bound to.
+///
+/// Carries NO trust status field: since §5.6c the status is derived from
+/// the certificate on read (`trust_status`). The old `status:
+/// NbcTrustStatus::Probation { since }` was written from the local clock at
+/// join and never read in production (KI#75).
 #[derive(Debug, Clone)]
 pub struct PeerTrust {
     pub nbc: NBC,
-    pub status: NbcTrustStatus,
     pub wallet_id: Option<WalletId>,
+}
+
+impl PeerTrust {
+    /// The peer's trust status at `now_tick`, derived from its NBC.
+    pub fn trust_status(&self, now_tick: u64) -> NbcTrustStatus {
+        if self.nbc.chain_depth == 0 {
+            NbcTrustStatus::Genesis
+        } else if is_probationary(&self.nbc, now_tick) {
+            NbcTrustStatus::Probation
+        } else {
+            NbcTrustStatus::Confirmed
+        }
+    }
 }
 
 /// Build a placeholder VBC for simulation/testing.
@@ -91,6 +132,9 @@ pub fn sim_nbc(node_id: NodeId, created_at: u64) -> NBC {
         founding_vbc_hash: [0u8; 32],
         network_size_baseline: 0, // sim — no baseline (genesis-style exempt)
         baseline_tick: 0,
+        // §5.3 does not apply to NBCs — Nabla citizens have no genesis family.
+        genesis_lineage: [0u8; 32],
+        nabla_registration: None,
     }
 }
 
@@ -244,6 +288,22 @@ pub fn verify_nbc_chain(
     Ok(())
 }
 
+/// Does this (already VERIFIED) certificate name a PINNED genesis Nabla key
+/// as its subject — `subject_pubkey_sphincs ∈
+/// nabla_genesis::NABLA_GENESIS_VALIDATOR_PKS` (KI#97, the raw SPHINCS+ public
+/// keys baked into Core)? THE one predicate (RULE 1): keyed by the pinned
+/// PUBLIC KEYS only — no config, no address, no node-id list.
+///
+/// ⚠ Fable 2026-10-01 F-5: confers ZERO trust. Its readers are an ORDER (the
+/// record-AE walk, `record_sync::TieredWalk`) and the emission ineligibility
+/// of genesis nodes; no verdict, ban, vouch, grade or answer acceptance may
+/// read it (`f5_genesis_predicate_confers_no_trust` greps the lib).
+pub fn nbc_is_pinned_genesis(nbc: &NBC) -> bool {
+    axiom_core_logic::nabla_genesis::NABLA_GENESIS_VALIDATOR_PKS
+        .iter()
+        .any(|k| k.as_slice() == nbc.subject_pubkey_sphincs.as_slice())
+}
+
 /// Extract the Ed25519 public key from an NBC, if present and valid (32 bytes).
 ///
 /// Returns None if the Ed25519 key is missing or not exactly 32 bytes.
@@ -295,16 +355,26 @@ pub fn verify_nbc_chain_via_core(
     let bundle = VBCProofBundle {
         target_vbc: nbc.clone(),
         supporting_vbcs: supporting.to_vec(),
+        candidacy_pulse: None, renewal_work_receipt: None,
     };
 
     // CL7 only reads vbc_bundle and transaction.epoch — other fields are unused
     let inputs = PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
+        claimant_vbc: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         recall_attestation: None,
         mode: CoreLogicMode::CL7,
         oods_attestation: None,
         // Nabla CL7 (VBC validation) doesn't process a TX; gate disabled by zero
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         transaction: Transaction {
             consumed_state_id: [0u8; 32],
             client_pk: vec![],
@@ -317,7 +387,6 @@ pub fn verify_nbc_chain_via_core(
             nonce: 0,
             epoch: current_tick,
             client_sig: vec![],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             required_k: 0,
@@ -354,12 +423,8 @@ pub fn verify_nbc_chain_via_core(
             audit_confirmation: None,
             nonce_response: None,
             audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
             wallet_secret: None,
             fanout_message: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -419,6 +484,15 @@ pub struct NbcSubject {
     pub ed25519_pk: Vec<u8>,
     pub dilithium_pk: Vec<u8>,
     pub node_name: String,
+    /// The node's ONE operator wallet (the owner, 2026-09-20: "Nabla binds one
+    /// wallet and that is the operator wallet"). MUST be a REAL account — a dev
+    /// account (`@axiom` / `@axiom.internal`) can never operate a Nabla node
+    /// (`AXIOM_DESIGN_FactClassIsolation.md` preamble point 0). Empty = not
+    /// declared (grandfathered genesis/renewal). `build_unsigned_nbc` rejects a
+    /// dev operator. ⚠ FOLLOW-UP: bind this into the NBC signing preimage at the
+    /// next genesis ceremony for a tamper-proof guarantee (today it is an
+    /// issuance-time check, which matches the k=1 Nabla trust model).
+    pub wallet_id: String,
 }
 
 /// Check if a node with the given NBC and SPHINCS+ SK is qualified to issue NBCs.
@@ -427,6 +501,70 @@ pub struct NbcSubject {
 ///   - Has a valid (non-expired) NBC
 ///   - Has SPHINCS+ secret key loaded
 ///   - NBC has been held long enough (maturity)
+/// YPX-002 §9.1.1a (RULED 2026-09-25) — the issuer's per-epoch signing budget.
+/// ONE (epoch, count) pair: the N+1-th certificate this node would SIGN inside
+/// one FOB epoch is refused (`ISSUER_CAP_REACHED`); the next epoch starts a
+/// fresh count. Persisted LAST in `NablaSnapshot` (no serde default) so a
+/// restart cannot reset it. Genesis certificates are signed offline at the
+/// ceremony, never through this path, so `chain_depth == 0` is exempt by
+/// construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct NbcIssuanceBudget {
+    /// FOB epoch id (`constants::nbc_issuance_epoch`) the count belongs to.
+    pub epoch: u64,
+    /// Certificates signed in `epoch`.
+    pub count: u64,
+}
+
+impl NbcIssuanceBudget {
+    /// Would signing one more certificate in `epoch` exceed `cap`? A different
+    /// epoch is a fresh budget (count reads as 0).
+    pub fn at_cap(&self, epoch: u64, cap: u64) -> bool {
+        let count = if self.epoch == epoch { self.count } else { 0 };
+        count >= cap
+    }
+
+    /// Record one signed certificate in `epoch` (rolls the count when the
+    /// epoch changed). Call AFTER a successful signature — a failed signing
+    /// must not consume budget.
+    pub fn record(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// Certificates signed in `epoch` so far (0 for any other epoch).
+    pub fn count_in(&self, epoch: u64) -> u64 {
+        if self.epoch == epoch { self.count } else { 0 }
+    }
+}
+
+/// §9.1.1a peer side — count a VERIFIED citizen certificate against its issuer
+/// for the epoch its own `issued_at` names. Returns `Some(seen)` when the
+/// count is now ABOVE `cap` (the caller logs `[NBC-ISSUER-OVER-CAP]` and
+/// counts it) — OBSERVABILITY ONLY, never a refusal: peers see certificates in
+/// different orders and a compromised key can backdate `issued_at`, so
+/// cross-node enforcement needs the evidence model (YPX-025) and is not ruled.
+/// Genesis (`chain_depth == 0`) and a certificate with no issuer are skipped.
+/// The map is keyed `(issuer node id, epoch)`; the caller owns pruning.
+pub fn note_issuer_certificate(
+    seen: &mut std::collections::HashMap<([u8; 32], u64), u64>,
+    nbc: &NBC,
+    cap: u64,
+) -> Option<([u8; 32], u64, u64)> {
+    if nbc.chain_depth == 0 {
+        return None;
+    }
+    let issuer_pk = nbc.issuer_set.first()?;
+    let issuer = axiom_core_logic::compute::compute_validator_id(issuer_pk);
+    let epoch = crate::constants::nbc_issuance_epoch(nbc.issued_at);
+    let n = seen.entry((issuer, epoch)).or_insert(0);
+    *n = n.saturating_add(1);
+    if *n > cap { Some((issuer, epoch, *n)) } else { None }
+}
+
 pub fn is_qualified_issuer(
     nbc: &NBC,
     sphincs_sk: Option<&[u8]>,
@@ -473,6 +611,18 @@ fn build_unsigned_nbc(
             format!("subject node_name exceeds 64 bytes: {}", subject.node_name.len()),
         ));
     }
+    // NO dev NBC (the owner, 2026-09-20; `AXIOM_DESIGN_FactClassIsolation.md`
+    // preamble point 0). A Nabla node's operator wallet MUST be a REAL account.
+    // Empty = not declared (grandfathered). A declared DEV operator is rejected
+    // — the issuance-time half; the Core money gate already blocks a dev
+    // operator's emission/withdrawal payouts.
+    if !subject.wallet_id.is_empty()
+        && axiom_core_logic::wallet_id::is_dev_wallet(&subject.wallet_id)
+    {
+        return Err(NablaError::NbcMalformed(
+            "dev account (@axiom / @axiom.internal) cannot operate a Nabla node — the operator wallet must be a real account".into(),
+        ));
+    }
 
     let validator_id = compute_validator_id(&subject.sphincs_pk);
     Ok(VBC {
@@ -499,6 +649,9 @@ fn build_unsigned_nbc(
         // certs are exempt.
         network_size_baseline: issuer_baseline.0,
         baseline_tick: if issuer_baseline.0 == 0 { 0 } else { issuer_baseline.1 },
+        // §5.3 does not apply to NBCs — Nabla citizens have no genesis family.
+        genesis_lineage: [0u8; 32],
+        nabla_registration: None,
     })
 }
 
@@ -573,14 +726,24 @@ pub fn issue_nbc_via_core(
     let bundle = VBCProofBundle {
         target_vbc: nbc.clone(),
         supporting_vbcs: vec![],
+        candidacy_pulse: None, renewal_work_receipt: None,
     };
     let inputs = PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
+        claimant_vbc: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         recall_attestation: None,
         mode: CoreLogicMode::CL8,
         oods_attestation: None,
         // Nabla CL8 (NBC issuance) doesn't process a TX; gate disabled by zero
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         transaction: Transaction {
             consumed_state_id: [0u8; 32],
             client_pk: vec![],
@@ -593,7 +756,6 @@ pub fn issue_nbc_via_core(
             nonce: 0,
             epoch: current_time,
             client_sig: vec![],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             required_k: 0,
@@ -630,12 +792,8 @@ pub fn issue_nbc_via_core(
             audit_confirmation: None,
             nonce_response: None,
             audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
             wallet_secret: None,
             fanout_message: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -718,6 +876,10 @@ pub fn renew_nbc(
         ed25519_pk: old_nbc.subject_pubkey_ed25519.clone(),
         dilithium_pk: old_nbc.subject_pubkey_dilithium.clone(),
         node_name: old_nbc.node_name.clone(),
+        // Renewal carries the existing identity forward; the operator wallet was
+        // validated at first issuance and the old NBC does not store it, so leave
+        // it empty (grandfathered — the dev-operator reject fires at first issuance).
+        wallet_id: String::new(),
     };
 
     // SEC-5 FIX: Use direct crypto path (dev/test fallback).
@@ -766,6 +928,10 @@ pub fn renew_nbc_via_core(
         ed25519_pk: old_nbc.subject_pubkey_ed25519.clone(),
         dilithium_pk: old_nbc.subject_pubkey_dilithium.clone(),
         node_name: old_nbc.node_name.clone(),
+        // Renewal carries the existing identity forward; the operator wallet was
+        // validated at first issuance and the old NBC does not store it, so leave
+        // it empty (grandfathered — the dev-operator reject fires at first issuance).
+        wallet_id: String::new(),
     };
 
     // Route through Core (CL8) — same as issue_nbc_via_core
@@ -834,6 +1000,10 @@ pub fn generate_node_keys(config_dir: &std::path::Path, node_name: &str) -> Resu
         ed25519_pk,
         dilithium_pk,
         node_name: node_name.to_string(),
+        // The node's ONE operator wallet is set by the caller from node config
+        // BEFORE issuance (checked in `build_unsigned_nbc`). keygen itself does
+        // not know it. Empty = not declared.
+        wallet_id: String::new(),
     })
 }
 
@@ -1157,7 +1327,9 @@ impl ClaimTracker {
     /// Check if a node can claim (24-hour / RUNNER_CLAIM_TICKS cooldown).
     pub fn can_claim(&self, node_id: &NodeId, current_tick: u64) -> bool {
         match self.last_claims.get(node_id) {
-            Some(&last_tick) => current_tick - last_tick >= RUNNER_CLAIM_TICKS,
+            // KI#47: value-span vs tick COUNT — project. Pre-fix the "24h" runner
+            // claim cooldown was really 4.8h.
+            Some(&last_tick) => current_tick - last_tick >= RUNNER_CLAIM_TICKS.to_secs(),
             None => true, // never claimed before
         }
     }
@@ -1176,13 +1348,24 @@ impl Default for ClaimTracker {
 
 /// Validate a runner claim.
 ///
-/// Checks:
+/// ⚠ **ALWAYS FAILS CLOSED — returns `Err(CcPayoutSelfAttested)` before any of
+/// the checks below run** (SEC-05; see the load-bearing comment in the body).
+/// The CC score is self-attested, so this function must not compute a payout
+/// until CC attestation is k-witnessed and Core-mediated.
+///
+/// This rustdoc used to describe only the checks and "Returns the computed
+/// claim amount", i.e. the UNREACHABLE code below the gate — inviting a reader
+/// to treat the early return as a regression and delete it (ghost audit G21).
+/// Removing that return requires the work listed in the body, in the same
+/// change.
+///
+/// Checks (UNREACHABLE until the gate is lifted):
 ///   - CC node_id matches claim node_id
 ///   - Claim cooldown has passed (one per 24 hours)
 ///   - CC score is non-zero
 ///   - CC proof would be verified by Core (Signer trait)
 ///
-/// Returns the computed claim amount.
+/// Returns the computed claim amount — once the SEC-05 gate is lifted.
 pub fn validate_runner_claim(
     claim: &RunnerClaim,
     pool: &RunnerPool,
@@ -1297,8 +1480,104 @@ pub fn compute_score(ticks_helped: u64, total_registrations: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// F-5 condition (a) — the predicate is keyed by the PINNED SPHINCS+
+    /// PUBLIC KEYS only: all ten pinned keys are genesis; a certificate that
+    /// carries a pinned NODE ID (`NABLA_GENESIS_VALIDATORS`, a digest) or a
+    /// root-authority key as its subject is not; nothing else is consulted.
+    #[test]
+    fn f5_genesis_predicate_is_the_pinned_keys_only() {
+        use axiom_core_logic::nabla_genesis as ng;
+        for k in ng::NABLA_GENESIS_VALIDATOR_PKS {
+            let mut c = sim_nbc([0x11; 32], 1_000_000);
+            c.subject_pubkey_sphincs = k.to_vec();
+            c.chain_depth = 1; // depth / name / address are not consulted
+            assert!(nbc_is_pinned_genesis(&c));
+        }
+        let mut by_id = sim_nbc(ng::NABLA_GENESIS_VALIDATORS[0], 1_000_000);
+        by_id.subject_pubkey_sphincs = ng::NABLA_GENESIS_VALIDATORS[0].to_vec();
+        assert!(!nbc_is_pinned_genesis(&by_id), "a node id is not a pinned key");
+        let mut root = sim_nbc([0x12; 32], 1_000_000);
+        root.subject_pubkey_sphincs = ng::NABLA_ROOT_AUTHORITY_PKS[0].to_vec();
+        assert!(!nbc_is_pinned_genesis(&root), "a root authority is not a genesis Nabla");
+        assert!(!nbc_is_pinned_genesis(&sim_nbc([0x13; 32], 1_000_000)));
+    }
+
     fn nid(b: u8) -> NodeId {
         [b; 32]
+    }
+
+    // ── GUIDE §5.6c join probation — the ONE predicate ──────────────────────
+
+    fn citizen_nbc(issued_at: u64) -> NBC {
+        let mut nbc = sim_nbc(nid(0x5C), issued_at);
+        nbc.chain_depth = 1;
+        nbc
+    }
+
+    /// Genesis (`chain_depth == 0`) is exempt at ANY age — even at issue.
+    #[test]
+    fn probation_genesis_is_exempt() {
+        let genesis = sim_nbc(nid(0x5C), 1_000_000);
+        assert_eq!(genesis.chain_depth, 0);
+        assert!(!is_probationary(&genesis, 1_000_000), "genesis at issue tick");
+        assert!(!is_probationary(&genesis, 1_000_001), "genesis one second later");
+    }
+
+    /// The boundary: probationary one second before expiry, confirmed AT
+    /// expiry (`issued_at + span <= now` → not probationary).
+    #[test]
+    fn probation_boundary_is_exact() {
+        let issued = 1_000_000u64;
+        let nbc = citizen_nbc(issued);
+        let ends = probation_ends_at(&nbc);
+        assert_eq!(ends, issued + nabla_probation_span_secs(),
+            "expiry = issued_at + the PROJECTED window (tick count × interval)");
+        assert!(is_probationary(&nbc, issued), "at issue");
+        assert!(is_probationary(&nbc, ends - 1), "one second before expiry");
+        assert!(!is_probationary(&nbc, ends), "at expiry");
+        assert!(!is_probationary(&nbc, ends + 1), "after expiry");
+    }
+
+    /// The window is the tick COUNT register projected through the tick
+    /// interval — a raw-count comparison (the KI#40/#165 class) would make
+    /// the dev window 60 s instead of 300 s and go red here.
+    #[test]
+    fn probation_window_is_projected_not_raw_count() {
+        let nbc = citizen_nbc(500);
+        let raw_count_expiry = 500 + NABLA_PROBATION_TICKS;
+        assert!(TICK_INTERVAL_SECS > 1, "premise: projection is observable");
+        assert!(is_probationary(&nbc, raw_count_expiry),
+            "still probationary where a raw-count comparison would have expired");
+        assert!(!is_probationary(&nbc, 500 + NABLA_PROBATION_TICKS * TICK_INTERVAL_SECS));
+    }
+
+    /// A re-join cannot reset the clock: the predicate takes ONLY the
+    /// certificate and the current tick — there is no `since` to restart.
+    /// Asserted by calling it with the same cert at increasing `now` and
+    /// showing the answer depends on the cert alone.
+    #[test]
+    fn probation_rejoin_does_not_reset() {
+        let nbc = citizen_nbc(1_000_000);
+        let ends = probation_ends_at(&nbc);
+        // "join" at issue, "re-join" half way, "re-join" again at the end.
+        assert!(is_probationary(&nbc, 1_000_000));
+        assert!(is_probationary(&nbc, 1_000_000 + nabla_probation_span_secs() / 2));
+        assert!(!is_probationary(&nbc, ends),
+            "expiry is anchored to issued_at, not to any of the joins above");
+        // And a NEWER certificate for the same node id is probationary again —
+        // the certificate is the identity the window is bound to.
+        let reissued = citizen_nbc(ends);
+        assert!(is_probationary(&reissued, ends));
+    }
+
+    /// `PeerTrust::trust_status` is the same rule, named.
+    #[test]
+    fn peer_trust_status_is_derived_from_the_certificate() {
+        let citizen = PeerTrust { nbc: citizen_nbc(1_000_000), wallet_id: None };
+        assert_eq!(citizen.trust_status(1_000_000), NbcTrustStatus::Probation);
+        assert_eq!(citizen.trust_status(probation_ends_at(&citizen.nbc)), NbcTrustStatus::Confirmed);
+        let genesis = PeerTrust { nbc: sim_nbc(nid(0x5C), 1_000_000), wallet_id: None };
+        assert_eq!(genesis.trust_status(1_000_000), NbcTrustStatus::Genesis);
     }
 
     /// Create a test NBC (= VBC) with deterministic fields.
@@ -1314,6 +1593,32 @@ mod tests {
         assert_eq!(nbc_node_id(&nbc), nid(0xAA));
         assert_eq!(nbc.issued_at, 0);
         assert_eq!(nbc.expires_at, NBC_EXPIRY_SECS);
+    }
+
+    /// The owner 2026-09-20: "Nabla binds one wallet and that is the operator
+    /// wallet" — and it MUST be a real account. NO dev NBC.
+    #[test]
+    fn build_unsigned_nbc_rejects_dev_operator() {
+        let issuer = make_nbc(0x01);
+        let real = NbcSubject {
+            sphincs_pk: vec![1u8; 32], ed25519_pk: vec![2u8; 32],
+            dilithium_pk: vec![3u8; 32], node_name: "citizen".into(),
+            wallet_id: "op@example.com".into(),           // REAL
+        };
+        assert!(build_unsigned_nbc(&real, &issuer, 0, (0, 0)).is_ok(),
+                "a real operator wallet must be accepted");
+
+        for dev in ["op@axiom", "op@axiom.internal", "SOAK@AXIOM"] {
+            let mut s = real.clone();
+            s.wallet_id = dev.into();
+            assert!(build_unsigned_nbc(&s, &issuer, 0, (0, 0)).is_err(),
+                    "dev operator {dev} must be rejected from an NBC");
+        }
+
+        let mut empty = real.clone();
+        empty.wallet_id = String::new();                  // undeclared
+        assert!(build_unsigned_nbc(&empty, &issuer, 0, (0, 0)).is_ok(),
+                "an undeclared operator is grandfathered (checked at declaration)");
     }
 
     // ── CC Chain Tests ──
@@ -1584,10 +1889,10 @@ mod tests {
         tracker.record_claim(nid(0xAA), 100);
 
         // Too soon (need RUNNER_CLAIM_TICKS gap)
-        assert!(!tracker.can_claim(&nid(0xAA), 100 + RUNNER_CLAIM_TICKS - 1));
+        assert!(!tracker.can_claim(&nid(0xAA), 100 + RUNNER_CLAIM_TICKS.to_secs() - 1));
 
         // Exactly at cooldown boundary
-        assert!(tracker.can_claim(&nid(0xAA), 100 + RUNNER_CLAIM_TICKS));
+        assert!(tracker.can_claim(&nid(0xAA), 100 + RUNNER_CLAIM_TICKS.to_secs()));
     }
 
     #[test]
@@ -1824,6 +2129,8 @@ mod tests {
             signatures: vec![],
             max_tx: 0,
             founding_vbc_hash: [0u8; 32],
+            genesis_lineage: [0u8; 32],
+            nabla_registration: None,
         };
         let payload = axiom_core_logic::compute::compute_vbc_signing_payload(&nbc);
         let sig = axiom_core_logic::compute::sign_sphincs(&root_sks[0], &payload).expect("sign");
@@ -2374,5 +2681,55 @@ mod tests {
         assert_eq!(renewed.subject_pubkey_sphincs, old_nbc.subject_pubkey_sphincs);
         assert_eq!(renewed.subject_pubkey_ed25519, old_nbc.subject_pubkey_ed25519);
         assert_eq!(renewed.node_name, old_nbc.node_name);
+    }
+
+    // ── YPX-002 §9.1.1a — issuer self-cap + peer alarm (RULED 2026-09-25) ──
+
+    /// The N+1-th certificate in one epoch is at cap; the N+1-th in the NEXT
+    /// epoch is not (fresh budget). MUTATION: `count >= cap` → `count > cap`
+    /// in `at_cap` lets the N+1-th through → this test goes red.
+    #[test]
+    fn nbc_issuance_budget_refuses_n_plus_one_in_epoch_not_in_next() {
+        let cap = 3u64;
+        let mut b = NbcIssuanceBudget::default();
+        for i in 0..cap {
+            assert!(!b.at_cap(7, cap), "certificate {} of {} is within budget", i + 1, cap);
+            b.record(7);
+        }
+        assert_eq!(b.count_in(7), cap);
+        assert!(b.at_cap(7, cap), "the N+1-th in the SAME epoch is refused");
+        assert!(!b.at_cap(8, cap), "the N+1-th in the NEXT epoch is not");
+        b.record(8);
+        assert_eq!((b.epoch, b.count), (8, 1), "the count rolled with the epoch");
+        assert_eq!(b.count_in(7), 0, "an old epoch reads as spent-nothing (it is gone)");
+    }
+
+    /// Peer alarm: fires ABOVE N, not AT N; genesis certificates are exempt;
+    /// two issuers keep separate counts. MUTATION: `*n > cap` → `*n >= cap`
+    /// → the "not at N" assertion goes red.
+    #[test]
+    fn nbc_issuer_over_cap_alarm_fires_above_n_not_at_n() {
+        let cap = 2u64;
+        let mk = |issuer: u8, issued_at: u64, depth: u8| {
+            let mut nbc = sim_nbc(nid(0x5C), issued_at);
+            nbc.chain_depth = depth;
+            nbc.issuer_set = vec![vec![issuer; 32]];
+            nbc
+        };
+        let span = crate::constants::fob_epoch_span_secs(false);
+        let t = span * 5 + 1; // inside epoch 5
+        let mut seen = std::collections::HashMap::new();
+        assert!(note_issuer_certificate(&mut seen, &mk(0xA1, t, 1), cap).is_none(), "1 of N");
+        assert!(note_issuer_certificate(&mut seen, &mk(0xA1, t + 1, 1), cap).is_none(), "AT N: no alarm");
+        let fired = note_issuer_certificate(&mut seen, &mk(0xA1, t + 2, 1), cap);
+        assert_eq!(fired.map(|(_, e, n)| (e, n)), Some((5, 3)), "ABOVE N: alarm names epoch + seen");
+        // A different issuer is a different budget.
+        assert!(note_issuer_certificate(&mut seen, &mk(0xB2, t, 1), cap).is_none());
+        // The next epoch is a fresh count for the same issuer.
+        assert!(note_issuer_certificate(&mut seen, &mk(0xA1, t + span, 1), cap).is_none());
+        // Genesis (chain_depth 0) is exempt however many.
+        for _ in 0..(cap + 2) {
+            assert!(note_issuer_certificate(&mut seen, &mk(0xA1, t, 0), cap).is_none(), "genesis exempt");
+        }
     }
 }

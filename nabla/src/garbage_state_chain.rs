@@ -118,6 +118,13 @@ impl GarbageStateChain {
 
 #[cfg(test)]
 mod tests {
+    /// KI#44: era identity is anchored at `GENESIS_NEWS_ANCHOR`, so raw synthetic
+    /// ticks like `0`/`50` are PRE-genesis and all collapse into era 0. Real ticks
+    /// are unix-scale. `t(n)` puts these fixtures on the real scale.
+    fn t(offset: u64) -> u64 {
+        axiom_core_logic::genesis_integrity::GENESIS_NEWS_ANCHOR + offset
+    }
+
     use super::*;
 
     fn make_state(n: u8) -> [u8; 32] {
@@ -136,9 +143,9 @@ mod tests {
         let path = dir.path().join("garbage_chain.state");
         assert!(GarbageStateChain::load(&path).unwrap().is_none(), "fresh path → None");
 
-        let mut chain = GarbageStateChain::new_default(0);
+        let mut chain = GarbageStateChain::new_default(t(0));
         let recalled = make_state(0xE5);
-        chain.insert(100, &recalled);
+        chain.insert(t(100), &recalled);
         chain.save(&path).unwrap();
 
         let reloaded = GarbageStateChain::load(&path).unwrap().expect("file exists");
@@ -150,18 +157,26 @@ mod tests {
 
     #[test]
     fn test_new_garbage_chain_starts_with_one_era() {
-        let chain = GarbageStateChain::new_default(1000);
+        let chain = GarbageStateChain::new_default(t(1000));
         assert_eq!(chain.era_count(), 1);
-        assert_eq!(chain.active_era_id(), 0);
+        // KI#44: the id is the absolute GRID cell the start tick falls in, not 0
+        // from a local origin. Compute it rather than hardcoding.
+        assert_eq!(
+            chain.active_era_id(),
+            crate::bloom_chain::era_id_for_tick(
+                t(1000),
+                crate::bloom_era::DEFAULT_ERA_DURATION_TICKS
+            )
+        );
     }
 
     #[test]
     fn test_insert_and_lookup_round_trip() {
-        let mut chain = GarbageStateChain::new(0, 100, 1000);
+        let mut chain = GarbageStateChain::new(t(0), 100, 1000);
         let s1 = make_state(1);
         let s2 = make_state(2);
         assert_eq!(chain.lookup(&s1), ChainLookup::Miss);
-        chain.insert(50, &s1);
+        chain.insert(t(50), &s1);
         match chain.lookup(&s1) {
             ChainLookup::Hit { era_id, .. } => assert_eq!(era_id, 0),
             ChainLookup::Miss => panic!("expected hit for s1"),
@@ -171,9 +186,9 @@ mod tests {
 
     #[test]
     fn test_insert_at_boundary_rotates_era() {
-        let mut chain = GarbageStateChain::new(0, 100, 1000);
-        chain.insert(50, &make_state(1)); // era 0
-        chain.insert(150, &make_state(2)); // crosses end_tick=100
+        let mut chain = GarbageStateChain::new(t(0), 100, 1000);
+        chain.insert(t(50), &make_state(1)); // era 0
+        chain.insert(t(150), &make_state(2)); // crosses end_tick=100
         assert_eq!(chain.era_count(), 2);
         assert_eq!(chain.active_era_id(), 1);
         // Old garbage still findable in frozen era 0
@@ -193,10 +208,10 @@ mod tests {
         // Two chains with the same content should NOT cross-pollute.
         // (This is more a type-system check than a runtime check — the
         // newtype prevents accidental insertion into the wrong chain.)
-        let mut g1 = GarbageStateChain::new(0, 100, 1000);
-        let mut g2 = GarbageStateChain::new(0, 100, 1000);
-        g1.insert(50, &make_state(1));
-        g2.insert(50, &make_state(1));
+        let mut g1 = GarbageStateChain::new(t(0), 100, 1000);
+        let mut g2 = GarbageStateChain::new(t(0), 100, 1000);
+        g1.insert(t(50), &make_state(1));
+        g2.insert(t(50), &make_state(1));
         // Both should agree on the same root since their content is identical
         let r1 = g1.inner().era(0).map(|e| e.meta.bloom_root);
         let r2 = g2.inner().era(0).map(|e| e.meta.bloom_root);

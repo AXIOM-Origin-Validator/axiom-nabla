@@ -16,15 +16,15 @@ path = "src/bin/nabla_sim.rs"
 name = "nabla-node"
 path = "src/bin/nabla_node.rs"
 
-[[bin]]
-name = "scar-proof-builder"
-path = "src/bin/scar_proof_builder.rs"
-
 [dependencies]
-axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["ceremony"] }
-axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
-axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
-axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = false, features = ["verify"] }
+# KI#86: jemalloc returns freed memory to the OS; glibc arena fragments under
+# gossip allocation churn (~60 MB/hr/node RSS creep, live-A/B-confirmed). Host-side,
+# CoreID-neutral. Wired always-on in src/bin/nabla_node.rs.
+tikv-jemallocator = "0.6"
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = true, features = ["ceremony"] }
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = true, features = ["riscv-interpreter"] }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
+axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = false, features = ["verify"] }
 # Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2c).
 axiom-errors = { workspace = true, features = ["std"] }
 blake3 = "1"
@@ -55,7 +55,25 @@ ctrlc = { version = "3", features = ["termination"] }
 [features]
 dev-status = []
 # Allow --dev flag in release builds (for testnet). Mainnet builds omit this.
+# ⚠ KI#240: it NO LONGER selects the protocol_nabla.toml DEV twins — `dev-tuning`
+# below does. They were one switch, so the only way to launch `--dev` was to also
+# run dev era/FOB/probation/NBC-cap timing, and on a ceremony-keyed tree that
+# contradicts the owner ruling (2026-10-01: real timing everywhere).
 dev-mode = []
+# Select the DEV twin of every protocol_nabla.toml register (era duration, FOB
+# tranche epoch, emission caps, FOB substitution grace, runner claim, join
+# probation, NBC issuance cap). VALUES ONLY — relaxes no check. Same split as
+# lambda's `dev-tuning` (KI#136). Passed ONLY by the one rule:
+# $(python3 scripts/build_profile.py --features axiom-nabla) — i.e. a dev-keyed tree.
+dev-tuning = []
+# Dev-only FLOOD CHAOS (src/flood_chaos.rs, ForkSettlement §9o proof obligations, KI#235/#236):
+# a per-node switch file `<data_dir>/flood-chaos` makes THIS node drop / hold+reorder the outbound
+# floods and head-AE entries of named wallets / txids, so a live gate can build the lost-flood
+# redeem fork and the honest reorder (tests/double_spend_fork_test.py --lost-flood /
+# --honest-reorder). Record-AE and ForkBan are never suppressed. NOT implied by dev-mode; the dev
+# build in scripts/axiom-env.py passes it explicitly and preflight
+# (scripts/check_flood_chaos_dev_only.sh) refuses any other recipe. NEVER FOR PRODUCTION.
+flood-chaos = []
 # Gate pulse calibration behind Lambda benchmark (production release only)
 pulse-gate = ["axiom-dmap-vm/pulse-gate"]
 

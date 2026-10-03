@@ -51,6 +51,9 @@ in `private/`. The setup script detects and installs these automatically.
     # To repack a binary tarball from source (for other Macs):
     ./deploy/repack-macos.sh
 
+    # Remove the launchd agent (com.axiom.nabla.plist):
+    ./deploy/uninstall-macos.sh
+
 ## Security
 
 - **Root authority keys** are used only during the genesis ceremony and then

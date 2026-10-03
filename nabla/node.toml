@@ -7,16 +7,67 @@
 # (keys + NBC) in a config/ directory next to this file.
 
 # Node name — any UTF-8 string up to 64 bytes.
-# Choose something meaningful: location, operator, etc.
+# Choose something meaningful: location, operator, etc. Emoji and non-Latin
+# scripts are fine — 焼き鳥 is a perfectly good node name.
+#
+# ── RESERVED NAMES ──────────────────────────────────────────────────────────
+# The 24 Greek letters are reserved for the genesis nodes, as both words and
+# symbols, upper or lower case, alone or with the `axiom-first-penguin-` prefix:
+#
+#   alpha    beta   gamma   delta   epsilon  zeta   eta    theta
+#   iota     kappa  lambda  mu      nu       xi     omicron pi
+#   rho      sigma  tau     upsilon phi      chi    psi    omega
+#
+#   α β γ δ ε ζ η θ ι κ λ μ ν ξ ο π ρ σ τ υ φ χ ψ ω ς
+#   Α Β Γ Δ Ε Ζ Η Θ Ι Κ Λ Μ Ν Ξ Ο Π Ρ Σ Τ Υ Φ Χ Ψ Ω
+#
+# A name that merely CONTAINS one is fine — "alpha-centauri" is yours to use.
+# Only the bare name is reserved.
+#
+# ⚠ THE RESERVATION IS HISTORICAL ONLY. A genesis node holds NO special
+# function, authority or priority in the mesh — it witnesses, gossips, serves
+# and can be demoted exactly like every other node. The names are reserved so
+# the network's first nodes stay identifiable in peer lists and logs, and for
+# no other reason. Your node is not a second-class citizen for lacking one.
+#
+# This is enforced by CORE at NBC issuance, not merely by the installer — a
+# reserved name is refused unless the identity IS the pinned genesis key for it.
+#
+# ⚠ Your name is baked into your NBC when your identity is issued and CANNOT be
+# changed afterwards. Renaming means re-issuing: remove config/ and rejoin.
 name = "nabla-node"
 
-# TCP port for peer-to-peer communication.
+# TCP port for peer-to-peer communication — what this node BINDS to locally.
 port = 6225
+
+# The port PEERS REACH YOU ON — REQUIRED, no default.
+#
+# Usually the same as `port` above. It differs when a router forwards a
+# different external port to this machine: if your router sends external 7000
+# to this node's 6225, set external_port = 7000.
+#
+# Why you have to tell us: your IP is observed by the peers you connect to, but
+# a listening port appears NOWHERE on the wire. TCP carries the source port,
+# which your kernel picks per connection and NAT rewrites again — so an observed
+# port is always wrong. Only you know which port reaches you.
+#
+# There is deliberately no default: a default is how someone advertises 6225
+# while their router forwards 7000, and nothing can detect that but a real
+# inbound connection. The node refuses to start rather than guess.
+external_port = 6225
 
 # Dashboard — operator web UI
 # Must not collide with the P2P port above.
 dashboard_port = 6226
 
-# Set to true to allow dashboard access from other machines.
-# WARNING: no authentication — only enable on trusted networks.
-dashboard_remote = true
+# The dashboard binds 127.0.0.1 ONLY — there is no remote option (YP
+# "Transport — functional endpoints", 2026-09-26). `dashboard_remote = true`
+# makes the node refuse to start. Read a remote node over the TCP-CBOR wire.
+
+# Operator wallet — the ONE real account that operates this node (the owner 2026-09-20:
+# "Nabla binds one wallet and that is the operator wallet"). It is checked at NBC
+# issuance and MUST be REAL-class — a dev account (@axiom / @axiom.internal) is
+# refused. For a GENESIS node this is the co-located validator's STAKE wallet_id
+# (the same stake email per node), e.g. "alpha@trustmesh.org/<pk_bind>". Empty = not
+# declared (grandfathered; NBC issuance will refuse it).
+operator_wallet = ""

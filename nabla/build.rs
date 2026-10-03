@@ -2,8 +2,9 @@
 //
 // Reads protocol_nabla.toml and generates src/tuning_gen.rs with compile-time
 // constants. A `foo` + `foo_dev` PAIR emits ONE constant under the base name,
-// selected by the `dev-mode` feature (same convention as protocol_core.toml /
-// protocol_lambda.toml). A standalone key emits a single always-on constant.
+// selected by the `dev-tuning` feature (KI#240 — was `dev-mode`; same split as
+// protocol_lambda.toml's KI#136 `dev-tuning`: VALUES ONLY, so a `--dev` launch no
+// longer drags dev timing onto a ceremony-keyed network). A standalone key emits a single always-on constant.
 // No external dependencies — uses only std.
 use std::fs;
 use std::path::Path;
@@ -48,7 +49,7 @@ fn main() {
         if let Some(base) = key.strip_suffix("_dev") {
             if has(base) {
                 out.push_str(&format!(
-                    "#[cfg(feature = \"dev-mode\")]\npub const {}: u64 = {};\n",
+                    "#[cfg(feature = \"dev-tuning\")]\npub const {}: u64 = {};\n",
                     base.to_uppercase(),
                     value
                 ));
@@ -57,7 +58,7 @@ fn main() {
         }
         if has(&format!("{key}_dev")) {
             out.push_str(&format!(
-                "#[cfg(not(feature = \"dev-mode\"))]\npub const {}: u64 = {};\n",
+                "#[cfg(not(feature = \"dev-tuning\"))]\npub const {}: u64 = {};\n",
                 key.to_uppercase(),
                 value
             ));

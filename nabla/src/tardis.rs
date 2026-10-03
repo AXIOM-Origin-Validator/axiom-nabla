@@ -21,8 +21,25 @@ use crate::constants::{
     CHILD_ROTATION_INTERVAL_TICKS, CHILD_ROTATION_JITTER_TICKS, D_RESERVATION_TICKS,
     MATURITY_TICKS_MAX, MATURITY_TICKS_MIN, PARENT_ROTATION_INTERVAL_TICKS,
     PARENT_ROTATION_JITTER_TICKS, PARENTLESS_TIMEOUT_TICKS, REBALANCE_COOLDOWN_TICKS,
-    TICK_INTERVAL_SECS,
+    TICK_INTERVAL_SECS, AUDIT_CHALLENGE_PENDING_TICKS, AUDIT_INBOX_OTHER_CAP,
 };
+
+/// KI#71 — this node's ONE signed root advertisement for a tick label.
+///
+/// Built ONLY by [`TardisNode::advertise_root`], and used by EVERY path that
+/// states "my root at tick T" — the per-tick `BroadcastRootHash` (process_tick
+/// step 9), the binary's anti-entropy `TickHash` (tick-loop Step 9) and the §5.5
+/// audit answer. Before 2026-10-01 the three sampled `smt.root_hash()` at three
+/// different instants under one tick label, so an honest writer whose SMT moved
+/// between them signed two different roots for the same tick and was convicted
+/// of SELF-CONTRADICTION (detach + cascade) — YPX-003 §1.3.5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootAdvert {
+    pub tick: u64,
+    pub root_hash: Hash256,
+    /// Signature over `crypto::tickhash_sign_payload(tick, root_hash, my_pk)`.
+    pub signature: Vec<u8>,
+}
 
 /// Consecutive ticks without verifiable grandpa-sig before a node detaches
 /// from its upstream and re-seeks. 10 ticks ≈ 50s at TICK_INTERVAL_SECS=5,
@@ -30,7 +47,10 @@ use crate::constants::{
 /// existing anti-thrash window. Short enough that broken chains don't
 /// linger; long enough that transient rotation-drain windows don't trigger
 /// false detaches.
-pub const GRANDPA_MISS_DETACH_THRESHOLD: u32 = 10;
+/// Re-exported from the tuning register (2026-08-01). Was hardcoded here; a
+/// tick-denominated protocol value belongs in protocol_nabla.toml next to its
+/// settle, where the two can be reviewed together.
+pub use crate::constants::GRANDPA_MISS_DETACH_THRESHOLD;
 
 /// KI#37 (2026-07-08) — QuestionableAlert cascade hygiene. An alert whose
 /// `tick` is more than this many seconds behind the local tick is dropped
@@ -106,6 +126,9 @@ pub enum TardisAction {
         tick: u64,
         root_hash: Hash256,
         node_pk: PeerId,
+        /// KI#71 — signed ONCE by `advertise_root`; the network layer sends it
+        /// as-is and never re-signs a fresh sample.
+        signature: Vec<u8>,
     },
     /// Send audit challenge to upstream.
     SendAuditRequest {
@@ -151,9 +174,96 @@ pub enum DetachReason {
     SilentParent,
 }
 
+/// Why this node lost its upstream, counted. Observability only — no protocol
+/// logic reads these.
+///
+/// **Two different questions, deliberately kept apart:**
+///   * `via_*` — the CODE PATH that cleared `up`. Every path is counted,
+///     including the ones that orphan a node without ever emitting a
+///     `DetachReason` (a peer going away, an audit disconnect).
+///   * `detach_*` — the protocol REASON carried by `TardisAction::DetachUpstream`.
+///     Counted where the action is EMITTED, because the detach handler calls
+///     `remove_peer()` and the reason is gone by the time `up` is cleared.
+///
+/// Modelled on `sim.rs::OrphanCause`, NOT copied from it: that enum predates the
+/// grandpa rule and has no variant for `GrandpaTickMissing`, which is ~95% of
+/// real detaches. Its `WriterCheck` variant is marked "disabled v0.9.1".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanCauseCounters {
+    pub via_detach_upstream: u64,
+    pub via_remove_peer: u64,
+    pub via_remove_peer_reserved: u64,
+    pub via_flag_questionable: u64,
+    pub detach_grandpa_tick_missing: u64,
+    pub detach_silent_parent: u64,
+    /// `DetachReason::ParentNotWriter` is declared but NEVER emitted — verified
+    /// 2026-08-06, zero occurrences in the live logs. Counted so that if it ever
+    /// starts firing, it shows up instead of hiding inside another bucket.
+    pub detach_parent_not_writer: u64,
+    // ── BY INTENT (KI#71) ────────────────────────────────────────────────
+    // The via_* buckets above name WHICH FUNCTION cleared `up`, not whether
+    // the loss was chosen or forced. That made a rise in healthy §2.2
+    // self-optimisation (103 of 114 clears in a 2h run) read as a doubled
+    // fault. Intent is what an operator actually wants to know.
+    /// Node chose to move (§2.2 rebalance, rotation). Healthy.
+    pub intent_voluntary: u64,
+    /// Node was forced off its parent. Counted at the sites that KNOW the
+    /// intent: the DetachUpstream action (grandpa-tick / silent parent) and the
+    /// audit flag.
+    ///
+    /// INCOMPLETE, deliberately: `remove_peer` serves both voluntary and forced
+    /// paths, so a loss via `remove_peer` that is neither marked voluntary nor
+    /// one of the above (e.g. a parent sending us TardisDetach) is counted in
+    /// `via_remove_peer` but in NEITHER intent bucket. Better uncounted than
+    /// miscounted — the whole reason these buckets exist is that counting by
+    /// call site made healthy self-optimisation look like a fault. Read
+    /// `intent_*` as a floor, not a partition of `via_*`.
+    pub intent_forced: u64,
+}
+
+impl OrphanCauseCounters {
+    /// `(label, count)` pairs, for /status and diagnostics.
+    pub fn as_pairs(&self) -> [(&'static str, u64); 9] {
+        [
+            ("via_detach_upstream", self.via_detach_upstream),
+            ("via_remove_peer", self.via_remove_peer),
+            ("via_remove_peer_reserved", self.via_remove_peer_reserved),
+            ("via_flag_questionable", self.via_flag_questionable),
+            ("detach_grandpa_tick_missing", self.detach_grandpa_tick_missing),
+            ("detach_silent_parent", self.detach_silent_parent),
+            ("detach_parent_not_writer", self.detach_parent_not_writer),
+            ("intent_voluntary", self.intent_voluntary),
+            ("intent_forced", self.intent_forced),
+        ]
+    }
+    pub fn total_cleared(&self) -> u64 {
+        self.via_detach_upstream + self.via_remove_peer
+            + self.via_remove_peer_reserved + self.via_flag_questionable
+    }
+}
+
 // ── TARDIS Node ──
 
 /// TARDIS tree node — manages tick authority for this Nabla node.
+/// Where a registration received by this node must be handled (KI#69).
+///
+/// Three states that `Option<PeerId>` could not represent: `None` previously
+/// meant both "I am the writer" and "I am an orphan", and callers acted on the
+/// first reading in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterRouting {
+    /// This node is write-qualified — handle the registration locally.
+    IAmWriter,
+    /// This node is a reader anchored in the mesh — redirect the sender here.
+    RedirectTo(PeerId),
+    /// This node is an orphan: not write-qualified AND no upstream to point at.
+    ///
+    /// It MUST refuse the registration. It has no authority to adjudicate and its
+    /// SMT head may be arbitrarily stale — answering produces a false
+    /// `StateMismatch` that a correct wallet records as a real divergence.
+    NoWriterKnown,
+}
+
 ///
 /// Five connection slots per the Implementation Guide §5.2:
 ///   UP  — upstream parent (receives ticks from)
@@ -181,6 +291,46 @@ pub struct TardisNode {
     audit_pass_count: u64,
     /// Number of ticks since last audit.
     ticks_since_audit: u64,
+    /// Prefix of the audit challenge we currently have in flight (KI#48
+    /// follow-up), with the tick VALUE it was issued at (KI#71). A response is
+    /// only evaluated if its prefix matches — without the pin, an upstream
+    /// could answer a prefix of its own choosing and the challenge's
+    /// unpredictability property is void. Not overwritten by a re-issue while
+    /// younger than `AUDIT_CHALLENGE_PENDING_TICKS`: since KI#71 the upstream
+    /// answers at its next advertisement instant (~1 tick later), and an
+    /// overwrite would turn every delayed honest answer into `unmatched`.
+    pending_audit_prefix: Option<(Vec<u8>, u64)>,
+    /// KI#71 — this node's root advertisement for its current tick label
+    /// (see [`RootAdvert`]). Sampled once per tick label.
+    root_advert: Option<RootAdvert>,
+    /// KI#71 — AuditRequests waiting for our NEXT advertisement instant, where
+    /// they are answered in the same SMT borrow that samples the advertised
+    /// root. `audit_inbox_other` counts the entries NOT from a current
+    /// downstream in the 8-bit challenge shape (bounded by
+    /// `AUDIT_INBOX_OTHER_CAP`); downstream entries are deduped, so at most 256
+    /// per child, and are never shed.
+    audit_inbox: Vec<SubtreeAuditRequest>,
+    audit_inbox_other: usize,
+    /// KI#71 counters (CLAUDE.md RULE 3 §2 — on /status via `audit_counters`).
+    /// `audit_requests_shed`: non-downstream requests dropped at the cap.
+    /// `audit_response_stale`: matched answers whose `response_tick` is OLDER
+    /// than the challenge — COUNTED, never dropped (a drop would stop us
+    /// evaluating a stale-answering equivocator). `audit_selfcontra_flags`:
+    /// SELF-CONTRADICTION convictions minted by this node.
+    audit_requests_shed: u64,
+    audit_response_stale: u64,
+    audit_selfcontra_flags: u64,
+    /// G5 — per-node PRIVATE audit entropy. Never sent, never derived from
+    /// anything the auditee can see. Without it the challenged prefix is a
+    /// public function of (tick, requester_pk) and the auditee can pre-compute
+    /// exactly which 1/256 of its database to keep honest.
+    audit_seed: [u8; 32],
+    /// G6 — audit responses refused because the sender is not our upstream,
+    /// and responses that matched no pending challenge. Counted because a
+    /// denial-of-audit is otherwise indistinguishable from a quiet network
+    /// (CLAUDE.md RULE 3 §2).
+    audit_responses_unauthorized: u64,
+    audit_responses_unmatched: u64,
 
     // ── Network Size (for dynamic maturity) ──
     unique_nodes_seen: u64,
@@ -219,6 +369,19 @@ pub struct TardisNode {
     /// this node is a qualified writer (needs ≥ 2). Updated each round
     /// by record_child_approvals().
     prev_round_approval_count: u8,
+    /// The tick number for which this node last emitted an approval to its
+    /// UPSTREAM. YPX-003 write-qualification condition 3 ("approved the
+    /// upstream's tick this interval") is `== current_tick`. Distinct from
+    /// `prev_round_approval_count`, which counts our CHILDREN approving US.
+    last_approved_upstream_tick: u64,
+    /// GUIDE §5.6a — our peers do not all observe the same source address for
+    /// us. Demotes this node to READ (see `is_self_writer`). Not persisted:
+    /// it is re-derived from live observations after any restart.
+    address_disputed: bool,
+    /// GUIDE §5.6a — how many distinct peers have reported our source address.
+    /// Stored beside the flag so the two can never drift. 0 means the check has
+    /// had NOTHING to evaluate — missing coverage, not a pass.
+    address_report_count: usize,
     /// Total open D slots in this node's subtree (§2.2, §2.14.5).
     /// Aggregated bottom-up: my_open + d1_subtree + d2_subtree.
     /// Updated from children's TickApproval.subtree_open_d each round.
@@ -233,19 +396,27 @@ pub struct TardisNode {
     /// Same as d1_reserved but for D2 slot.
     d2_reserved: Option<(PeerId, u64)>,
 
-    // ── §32 Merge Protocol State ──
-    /// Whether this node is currently in merge quarantine.
-    merge_quarantine_active: bool,
-    /// Tick when merge quarantine started (0 = not in quarantine).
-    merge_quarantine_start_tick: u64,
+    /// Orphan-cause counters (observability only).
+    orphan_causes: OrphanCauseCounters,
+    /// Self-contradiction flags SUPPRESSED because the answer matched our own
+    /// root (see the exonerate-only guard). Counted so the guard is observable:
+    /// a silent guard is indistinguishable from a dead one.
+    audit_exonerated: u64,
+    /// Alerts naming our upstream that carried no verified proof — ignored
+    /// for detach purposes. Counted so "we never detached" is observable.
+    alerts_unproven_ignored: u64,
+
+    // ── §32 TickHash root advertisements (the §32 quarantine timer, SCAN and
+    // `merge_forked_wallets` were retired 2026-10-02 — ForkSettlement §9r-E4) ──
     /// Root hashes received from other branches during gossip.
     /// Used for fork detection: if root_hash differs at same tick → possible fork.
     /// Maps tick → (sender_pk, root_hash).
-    branch_root_hashes: HashMap<u64, Vec<(PeerId, Hash256)>>,
-    /// WalletIds that triggered §32 quarantine (the actual forks).
-    /// Populated during handle_fork_evidence(). Used by resolve_merge()
-    /// to distinguish forked from tainted-innocent.
-    merge_forked_wallets: Vec<WalletId>,
+    /// Advertisements received via TickHash gossip, keyed by tick.
+    /// `(advertiser, root, signature)` — the SIGNATURE is retained so a
+    /// self-contradiction is provable evidence (two signed statements) rather
+    /// than this node's recollection. Without it, an accusation could not be
+    /// verified by anyone it was cascaded to.
+    branch_root_hashes: HashMap<u64, Vec<(PeerId, Hash256, Vec<u8>)>>,
 
     /// Random per-process seed mixed into rotation jitter — prevents the
     /// synchronized-rotation cluster trap. Without this, every rolling
@@ -323,6 +494,21 @@ impl TardisNode {
             upstream_status: NodeStatus::Disconnected,
             audit_pass_count: 0,
             ticks_since_audit: 0,
+            pending_audit_prefix: None,
+            root_advert: None,
+            audit_inbox: Vec::new(),
+            audit_inbox_other: 0,
+            audit_requests_shed: 0,
+            audit_response_stale: 0,
+            audit_selfcontra_flags: 0,
+            audit_seed: {
+                use rand::RngCore;
+                let mut s = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut s);
+                s
+            },
+            audit_responses_unauthorized: 0,
+            audit_responses_unmatched: 0,
             unique_nodes_seen: 1, // at minimum, we see ourselves
             mesh_peer_count: 0,
             last_known_open_slots: Vec::new(),
@@ -333,13 +519,16 @@ impl TardisNode {
             ticks_since_parent_rotation: 0,
             ticks_with_current_parent: 0,
             prev_round_approval_count: 0,
+            last_approved_upstream_tick: 0,
+            address_disputed: false,
+            address_report_count: 0,
             subtree_d_available: 0,
             d1_reserved: None,
             d2_reserved: None,
-            merge_quarantine_active: false,
-            merge_quarantine_start_tick: 0,
+            orphan_causes: OrphanCauseCounters::default(),
+            audit_exonerated: 0,
+            alerts_unproven_ignored: 0,
             branch_root_hashes: HashMap::new(),
-            merge_forked_wallets: Vec::new(),
             boot_seed: rand::random(),
             rotations_completed: 0,
             grandpa_miss_count: 0,
@@ -496,7 +685,22 @@ impl TardisNode {
         // Every tick carries known open D slots. If parent dies, we already
         // know where to reconnect — no discovery delay.
         if !tick.available_slots.is_empty() {
-            self.last_known_open_slots = tick.available_slots.clone();
+            // KI#48 STORM FIX. `TICK_SLOT_PIGGYBACK_MAX` (8) is the documented
+            // bound on slot hints riding a tick — and it was enforced ONLY in
+            // `sim.rs:1759`. The node stored and forwarded the list VERBATIM, so
+            // it grew without bound as ticks propagated. `recovery_candidates()`
+            // returns this list, and orphan recovery sends ONE ATTACH REQUEST PER
+            // ENTRY — which is the attach storm: measured 10,141 requests from a
+            // single node in one tick, uniformly across all 10, growing ~10x per
+            // 5 ticks until the process is OOM-killed. Fifth instance this
+            // session of a bound that exists in the register and the simulator
+            // and never ran in the product.
+            self.last_known_open_slots = tick
+                .available_slots
+                .iter()
+                .take(crate::constants::TICK_SLOT_PIGGYBACK_MAX)
+                .cloned()
+                .collect();
         }
 
         let mut actions = Vec::new();
@@ -515,19 +719,117 @@ impl TardisNode {
         //        chain breaks (e.g. parent loses children) the very next
         //        honestly-signed tick reflects the new `downstream_approvals`
         //        value, and we react to it within one tick.
-        //   (iii) (deferred) cryptographic verification of `prev_sig`
-        //        against `grandparent_pk`'s NBC-bound Ed25519 PK requires
-        //        the grandparent's signed tick payload, which isn't
-        //        currently carried in the wire. Adding it is a future
-        //        extension; for the heal-storm bug we're solving today,
-        //        (i)+(ii) is sufficient because (ii) catches the "phantom
-        //        writer" pattern (parent thinks it's a writer but isn't).
+        //   (iii) cryptographic verification of `prev_sig` against
+        //        `grandparent_pk`'s NBC-bound Ed25519 PK. ⚠ THIS IS BUILT
+        //        AND ENFORCING — it is NOT deferred. An earlier version of
+        //        this comment said the grandparent's signed payload "isn't
+        //        currently carried in the wire"; that has been false since
+        //        the §7.6 lineage work landed, and reading it as current
+        //        cost a full investigation on 2026-08-06.
         //
-        // All three conditions MUST be true for grandpa_ok. On miss for
-        // 10 consecutive ticks, emit DetachUpstream → orphan recovery.
+        //        `TickMessage.gp_commitment` (types.rs) carries the
+        //        grandparent's commitment fields; `tardis.rs` (build-tick,
+        //        below) POPULATES it; and `nabla_node.rs` (recv, ~2255)
+        //        reconstructs the commitment via
+        //        `crypto::tick_commitment_fields` and checks THREE things:
+        //        Ed25519 sig over that commitment, tick freshness
+        //        (LINEAGE_FRESHNESS_TICKS), and strict-parent (our parent
+        //        must appear in the grandparent's child set). Failure DROPS
+        //        the tick and, if the sender's own signature is valid,
+        //        accuses it into quarantine consensus. It runs under --dev.
+        //
+        //        Verified live 2026-08-06 (kappa, RUST_LOG=nabla_node=debug):
+        //        [LINEAGE-OK] on real traffic, drift=0, LINEAGE-SKIP=0.
+        //        `[LINEAGE-OK]` is debug + rate-limited (number % 120) so it
+        //        is INVISIBLE at the production `info` level — silence is not
+        //        evidence the check is dead. See the lineage counters on
+        //        /status, which exist so this is observable without a restart.
+        //
+        // GRANDPA_OK BELOW IS A SEPARATE, WEAKER RULE — a PRESENCE check
+        // (`grandparent_pk.is_some() && !prev_sig.is_empty()`) that decides
+        // whether to DETACH. Do not confuse the two: (iii) rejects a FORGED
+        // lineage; grandpa_ok reacts to an ABSENT one. On miss for
+        // GRANDPA_MISS_DETACH_THRESHOLD consecutive ticks, emit
+        // DetachUpstream → orphan recovery.
         let parent_is_writer = tick.downstream_approvals >= 2;
         let chain_present = tick.grandparent_pk.is_some() && !tick.prev_sig.is_empty();
-        let grandpa_ok = parent_is_writer && chain_present;
+
+        // ── KI#48: SETTLE GRACE ON A NEW PARENT ──────────────────────────────
+        // `parent_is_writer` requires the parent to ALREADY hold two children.
+        // But a parent gets its second child only by keeping the first — and the
+        // first leaves after GRANDPA_MISS_DETACH_THRESHOLD ticks if the parent
+        // has not become a writer yet. Circular: a dc=1 parent can never climb
+        // to dc=2, so the mesh manufactures no writers and every attach is
+        // undone. Measured live 2026-08-01: 2,478 successful attaches against
+        // 2,147 GrandpaTickMissing detaches in one window, with orphan recovery
+        // working underneath.
+        //
+        // Introduced by `e11cc84e` (2026-05-30), the day AFTER the §2.4.7 kick
+        // test recorded 5 stable writers and 0 detach events. Nothing re-ran that
+        // test afterwards.
+        //
+        // The grace gives a freshly-attached parent GRANDPA_SETTLE_TICKS to
+        // acquire its second child before its children start counting misses.
+        // This is NOT a fallback: nothing weaker is substituted and no failure is
+        // swallowed. The check runs in full, just not before the parent has had a
+        // fair chance to satisfy it. (`WRITER_SETTLE_TICKS` was meant to be this
+        // guard and is dead code — declared, never consumed.)
+        // ── ORIGIN CARVE-OUT (AXIOM Origin ruling, 2026-08-01) ──────────────
+        // "If it does not have a parent, and it has two downstream, it SHOULD
+        //  generate ticks — and actively seek a parent. This stops orphans."
+        //
+        // A node with no upstream is an ORIGIN, and TARDIS has no root — only an
+        // origin (§1.1). Its ticks legitimately carry `grandparent_pk: None`,
+        // because there is no grandparent to name. But `chain_present` demanded
+        // `grandparent_pk.is_some()`, so EVERY child of an origin failed the
+        // grandpa check and detached after GRANDPA_MISS_DETACH_THRESHOLD ticks.
+        // The origin then dropped below dc=2, stopped qualifying as a writer,
+        // and the subtree disintegrated — which is the orphan cascade: measured
+        // `write:100% orph:10` (every node holding two downstream, producing
+        // nothing that its children would accept).
+        //
+        // An origin's tick is legitimate when the origin itself is
+        // write-qualified — it holds D1+D2 and carries their approvals. That is
+        // the same evidence any other writer offers; the only thing it cannot
+        // offer is a grandparent, and demanding one of a node that by
+        // definition has none is the bug.
+        //
+        // This does NOT weaken the chain rule for non-origins: a parent that
+        // CLAIMS an upstream must still present it (`chain_present`), and
+        // nabla_node.rs separately ENFORCES the lineage signature whenever a
+        // tick carries `grandparent_pk` + `gp_commitment`. A forged
+        // "I am an origin" claim buys nothing — the sender still needs two
+        // genuine downstream approvals, which are Ed25519-signed by the children.
+        // DETACH ONLY IF THERE IS NO GRANDPA (AXIOM Origin, 2026-08-01).
+        // The rule is named GrandpaTickMissing and that is ALL it should mean.
+        // It previously required `parent_is_writer && chain_present`, so a child
+        // also left a parent that simply had not become a writer YET — and since
+        // a parent becomes a writer only by KEEPING two children, that is
+        // circular and no dc=1 parent could ever climb to dc=2.
+        //
+        //   * parent claims an upstream  -> the chain must be present
+        //     (`chain_present`). A parent WITH a grandpa is a valid link
+        //     whatever its own downstream count; not-yet-a-writer is not a
+        //     reason to leave.
+        //   * parent is an ORIGIN (no upstream, so `grandparent_pk: None`) ->
+        //     TARDIS has no root, only an origin (§1.1), and an origin cannot
+        //     name a grandparent. Its legitimacy is its OWN two downstream
+        //     approvals, which are Ed25519-signed by the children. So an origin
+        //     with dc=2 may generate ticks, and its children stay attached while
+        //     it actively seeks a parent.
+        //
+        // This is what stops the orphan cascade: previously EVERY child of an
+        // origin detached after GRANDPA_MISS_DETACH_THRESHOLD, the origin fell
+        // below dc=2, and its subtree disintegrated — measured `write:100%
+        // orph:10`, every node holding two downstream and producing nothing its
+        // children would accept.
+        //
+        // A forged "I am an origin" claim buys nothing: the sender still needs
+        // two genuine downstream approvals it cannot fabricate.
+        let is_origin_tick = tick.grandparent_pk.is_none();
+        let settled = self.ticks_with_current_parent >= crate::constants::GRANDPA_SETTLE_TICKS;
+        let grandpa_ok = !settled
+            || if is_origin_tick { parent_is_writer } else { chain_present };
         if grandpa_ok {
             self.grandpa_miss_count = 0;
         } else {
@@ -541,6 +843,10 @@ impl TardisNode {
                         parent,
                         reason: DetachReason::GrandpaTickMissing,
                     });
+                    // Counted HERE, where the reason is known. The handler calls
+                    // remove_peer(), so by the time `up` is cleared the reason
+                    // is gone and only `via_remove_peer` would increment.
+                    self.orphan_causes.detach_grandpa_tick_missing += 1;
                 }
                 self.grandpa_miss_count = 0; // reset; orphan recovery owns next steps
             }
@@ -580,7 +886,14 @@ impl TardisNode {
             prev_sig: tick.signature.clone(), // chain proof: parent's signature
             grandparent_pk: self.up, // our upstream = D1/D2's grandparent
             timestamp_ms: now_ms,
-            available_slots: tick.available_slots.clone(),
+            // Bounded forward — see the storm note above. Without the cap the
+            // list accumulates on every hop and every tick.
+            available_slots: tick
+                .available_slots
+                .iter()
+                .take(crate::constants::TICK_SLOT_PIGGYBACK_MAX)
+                .cloned()
+                .collect(),
             downstream_approvals: self.prev_round_approval_count, // OWN approval count, not parent's
             subtree_d_available: self.subtree_d_available, // aggregated from children's approvals
             oods_tardis,
@@ -634,14 +947,23 @@ impl TardisNode {
                 approval,
                 target: *up_pk,
             });
+            // YPX-003 condition 3: record that we approved our upstream for THIS
+            // tick. Write qualification reads it back in `is_self_writer`.
+            self.last_approved_upstream_tick = tick.number;
         }
 
-        // 9. Broadcast root hash via gossip mesh for partition detection
+        // 9. Broadcast root hash via gossip mesh for partition detection.
+        //    KI#71: through the ONE advertisement builder — the same SMT borrow
+        //    answers every queued §5.5 audit request, so our audit answer for
+        //    this tick can never contradict the root we advertise for it.
+        let (advert, audit_responses) = self.advertise_root(smt, signer);
         actions.push(TardisAction::BroadcastRootHash {
-            tick: tick.number,
-            root_hash: smt.root_hash(),
+            tick: advert.tick,
+            root_hash: advert.root_hash,
             node_pk: self.my_pk,
+            signature: advert.signature,
         });
+        actions.extend(audit_responses);
 
         Ok(actions)
     }
@@ -709,15 +1031,47 @@ impl TardisNode {
     // ── Bottom-Up Verification (§5.5) ──
 
     /// Generate a random subtree audit challenge for our upstream.
-    /// Called periodically (e.g., every few ticks).
-    pub fn generate_audit_request(&self) -> Option<TardisAction> {
+    /// Called periodically (e.g., every few ticks). Records the challenged
+    /// prefix so the response can be matched to it (unpredictability is only
+    /// worth something if the answer is checked against the question).
+    pub fn generate_audit_request(&mut self) -> Option<TardisAction> {
         let up_pk = self.up?;
 
-        // Pick a random prefix — one byte = audit 1/256th of keyspace
-        // Use tick + our pk as entropy source (deterministic but unpredictable to upstream)
-        let prefix_byte =
-            blake3::hash(&[&self.current_tick.to_le_bytes()[..], &self.my_pk[..]].concat());
+        // §5.5 requires an UNPREDICTABLE prefix ("Pick random subtree prefix
+        // (unpredictable)" — the spec pseudocode uses an RNG).
+        //
+        // RULE 0 marker (2026-08-07, ghost audit G5 — the old comment was
+        // FALSE). This read:
+        //     blake3(current_tick ‖ my_pk)[0]
+        //     "deterministic but unpredictable to upstream"
+        // Both inputs are PUBLIC to the upstream: it receives the tick it just
+        // broadcast, and `my_pk` is the requester's peer id — carried in the
+        // request itself as `requester_pk`. So the upstream could compute every
+        // downstream's next prefix for every tick, keep exactly that 1/256 of
+        // the keyspace honest, and tamper the rest undetected. The audit
+        // verified a slice the auditee chose.
+        //
+        // Now derived from a per-node PRIVATE seed, so it stays deterministic
+        // (replayable in tests via `set_audit_seed`) while being unpredictable
+        // to everyone else. The seed never leaves the node.
+        // KI#71: a challenge younger than AUDIT_CHALLENGE_PENDING_TICKS is still
+        // owed an answer (the upstream answers at its NEXT advertisement
+        // instant). Re-issuing now would overwrite the prefix and the delayed
+        // honest answer would be dropped as `unmatched` — the audit would never
+        // evaluate anything (RULE 3). Tick VALUEs are unix seconds (KI#47), so
+        // the COUNT is projected through `ticks_to_secs`.
+        if let Some((_, issued_at)) = &self.pending_audit_prefix {
+            if self.current_tick.saturating_sub(*issued_at)
+                < axiom_core_logic::types::ticks_to_secs(AUDIT_CHALLENGE_PENDING_TICKS)
+            {
+                return None;
+            }
+        }
+        let prefix_byte = blake3::hash(
+            &[&self.audit_seed[..], &self.current_tick.to_le_bytes()[..]].concat(),
+        );
         let prefix = vec![prefix_byte.as_bytes()[0]];
+        self.pending_audit_prefix = Some((prefix.clone(), self.current_tick));
 
         let request = SubtreeAuditRequest {
             prefix,
@@ -732,15 +1086,95 @@ impl TardisNode {
         })
     }
 
-    /// Handle an audit request from a downstream node.
-    /// Returns the subtree proof for the requested prefix.
+    /// KI#71 — THE one builder for this node's root advertisement at its
+    /// current tick label, and the ONLY production place a §5.5 audit answer is
+    /// built. Samples `smt.root_hash()` once per tick label, signs
+    /// `(tick, root, my_pk)`, caches it, and answers every queued AuditRequest
+    /// in the SAME `&smt` borrow, so `response.root_hash` == the advertised
+    /// root and `response.response_tick` == the advertised tick.
+    ///
+    /// A second call within the same tick label returns the cached advert and
+    /// answers nothing — requests that arrived after the sample wait for the
+    /// next tick's fresh sample (the SMT may have moved since).
+    pub fn advertise_root(
+        &mut self,
+        smt: &SparseMerkleTree,
+        signer: &dyn Signer,
+    ) -> (RootAdvert, Vec<TardisAction>) {
+        if let Some(adv) = &self.root_advert {
+            if adv.tick == self.current_tick {
+                return (adv.clone(), Vec::new());
+            }
+        }
+        let root_hash = smt.root_hash();
+        let advert = RootAdvert {
+            tick: self.current_tick,
+            root_hash,
+            signature: signer.sign(&crypto::tickhash_sign_payload(
+                self.current_tick,
+                &root_hash,
+                &self.my_pk,
+            )),
+        };
+        self.root_advert = Some(advert.clone());
+        let queued = std::mem::take(&mut self.audit_inbox);
+        self.audit_inbox_other = 0;
+        let responses = queued
+            .iter()
+            .map(|req| self.handle_audit_request(req, smt, signer))
+            .collect();
+        (advert, responses)
+    }
+
+    /// KI#71 — queue an AuditRequest for our next advertisement instant
+    /// ([`Self::advertise_root`]). Returns false if it was shed at the cap.
+    ///
+    /// Bounding without a new denial-of-audit: a request from one of OUR
+    /// downstream slots (D1/D2/P) in the 8-bit challenge shape that
+    /// `generate_audit_request` emits is ALWAYS kept (deduped on
+    /// (requester, prefix), so at most 256 per child — a spoofer cannot crowd
+    /// out the honest prefix). Anything else is still answered, up to
+    /// `AUDIT_INBOX_OTHER_CAP` per tick; overflow is counted, never silent.
+    /// Wire intake is unchanged: before KI#71 every request was answered
+    /// immediately and unbounded.
+    pub fn queue_audit_request(&mut self, request: &SubtreeAuditRequest) -> bool {
+        let dup = self.audit_inbox.iter().any(|q| {
+            q.requester_pk == request.requester_pk
+                && q.prefix == request.prefix
+                && q.prefix_bits == request.prefix_bits
+        });
+        if dup {
+            return true;
+        }
+        let from_downstream = [self.d1, self.d2, self.pending]
+            .iter()
+            .any(|s| *s == Some(request.requester_pk));
+        let challenge_shape = request.prefix_bits == 8 && request.prefix.len() == 1;
+        if !(from_downstream && challenge_shape) {
+            if self.audit_inbox_other >= AUDIT_INBOX_OTHER_CAP {
+                self.audit_requests_shed = self.audit_requests_shed.saturating_add(1);
+                return false;
+            }
+            self.audit_inbox_other += 1;
+        }
+        self.audit_inbox.push(request.clone());
+        true
+    }
+
+    /// Build the §5.5 answer to `request` from `smt` AT THIS INSTANT.
+    ///
+    /// Production never calls this directly — it goes through
+    /// [`Self::queue_audit_request`] + [`Self::advertise_root`], which call it
+    /// in the same SMT borrow that samples the advertised root (KI#71). The
+    /// single-threaded sim (`sim.rs`) calls it directly: its SMT cannot move
+    /// between the parent's advert and this answer within one sim step.
     pub fn handle_audit_request(
         &self,
         request: &SubtreeAuditRequest,
         smt: &SparseMerkleTree,
         signer: &dyn Signer,
     ) -> TardisAction {
-        let subtree_hash = smt.subtree_hash_at(request.prefix_bits);
+        let (subtree_hash, siblings) = smt.subtree_proof(&request.prefix, request.prefix_bits);
         let root_hash = smt.root_hash();
 
         let mut response = SubtreeAuditResponse {
@@ -750,6 +1184,7 @@ impl TardisNode {
             root_hash,
             response_tick: self.current_tick,
             responder_pk: self.my_pk,
+            siblings,
             signature: vec![], // filled below
         };
         response.signature = signer.sign(&crypto::audit_response_sign_payload(&response));
@@ -782,27 +1217,250 @@ impl TardisNode {
         our_smt: &SparseMerkleTree,
         signer: &dyn Signer,
     ) -> Result<TardisAction, NablaError> {
-        // Compare upstream's root hash against what we expect.
         let our_root = our_smt.root_hash();
 
-        if response.root_hash != our_root {
+        // ── Responder authorization (§5.5: we audit our UPSTREAM) ──
+        //
+        // RULE 0 marker (2026-08-07, ghost audit G6). Nothing here checked WHO
+        // answered. The binary verifies the signature (KI#19, NBC-anchored), so
+        // the responder is AUTHENTICATED — but any node holding a valid NBC is
+        // authenticated, and none of them but our upstream is authorized to
+        // answer our challenge.
+        //
+        // Combined with the old `.take()` below that was a free, silent
+        // denial-of-audit: `take()` ran BEFORE the prefix comparison, so ANY
+        // response — even a junk prefix — consumed the pending challenge and
+        // our upstream's real answer was then dropped as unsolicited. One peer
+        // sending one response per tick disabled another node's upstream
+        // auditing indefinitely, and the only trace was a `debug!` line.
+        if Some(response.responder_pk) != self.up {
+            self.audit_responses_unauthorized =
+                self.audit_responses_unauthorized.saturating_add(1);
             log::warn!(
-                "Audit: root mismatch. Upstream: {:?}, ours: {:?}",
+                "[AUDIT-RESP-NOT-UPSTREAM] responder={:02x}{:02x} is not our upstream                  — dropped WITHOUT consuming the pending challenge (§5.5)",
+                response.responder_pk[0], response.responder_pk[1],
+            );
+            return Ok(TardisAction::None);
+        }
+
+        // ── Challenge/response binding (KI#48 follow-up) ──
+        // Only evaluate a response to the prefix WE challenged. An unsolicited
+        // or stale response is dropped, not flagged — crossed messages are
+        // honest network noise; `ticks_since_audit` keeps growing so a fresh
+        // challenge goes out next tick.
+        //
+        // Consume ONLY on a match. Taking first discards the challenge that a
+        // late-but-correct answer still needs.
+        match &self.pending_audit_prefix {
+            Some((expected, challenge_tick)) if *expected == response.prefix => {
+                // KI#71 (Fable): an answer for a tick OLDER than our challenge is
+                // COUNTED and still evaluated — never dropped. A drop path here
+                // would let an equivocator escape the self-contradiction check
+                // simply by answering with a stale tick label.
+                if response.response_tick < *challenge_tick {
+                    self.audit_response_stale = self.audit_response_stale.saturating_add(1);
+                    log::debug!(
+                        "[AUDIT-RESP-STALE] response_tick={} < challenge_tick={} — counted, evaluated",
+                        response.response_tick, challenge_tick
+                    );
+                }
+                self.pending_audit_prefix = None;
+            }
+            _ => {
+                self.audit_responses_unmatched =
+                    self.audit_responses_unmatched.saturating_add(1);
+                log::debug!(
+                    "Audit: response prefix {:02x?} does not match a pending challenge — dropped",
+                    &response.prefix
+                );
+                return Ok(TardisAction::None);
+            }
+        }
+
+        // ── Proof verification (§5.5 step 4, the real one) ──
+        // The response's subtree_hash + sibling path must fold back to the
+        // root_hash the response itself claims. A response that fails this
+        // is internally inconsistent — a provable lie about the upstream's
+        // own database, whatever our own root looks like.
+        if !SparseMerkleTree::verify_subtree_proof(
+            &response.root_hash,
+            &response.prefix,
+            &response.subtree_hash,
+            &response.siblings,
+        ) {
+            log::warn!(
+                "Audit: subtree proof does NOT reconstruct to the claimed root {:?} (prefix {:02x?}, {} siblings)",
+                &response.root_hash[..4],
+                &response.prefix,
+                response.siblings.len()
+            );
+            // The signed response is self-refuting: its own proof does not fold
+            // to the root it claims. No advertisement needed.
+            return Ok(self.flag_questionable(
+                response.responder_pk,
+                signer,
+                Some(QuestionableEvidence {
+                    audit_response: response.clone(),
+                    advertised_root: None,
+                    advertised_sig: Vec::new(),
+                }),
+            ));
+        }
+
+        // §5.5 (AXIOM_GUIDE_Nabla.md): the audit asks "is UP lying about its
+        // OWN database?" — a SELF-consistency check. Beyond the proof above,
+        // the upstream must not contradict itself: the root it answers with
+        // must be the root it advertised via TickHash gossip for the same
+        // tick.
+        //
+        // KI#48: the previous body compared the upstream's root against OUR
+        // root and flagged QUESTIONABLE on mismatch. A freshly re-attached
+        // orphan is divergent by definition, so its first audit (~5 ticks
+        // after attach) always "failed", detaching it again — the orphan
+        // oscillation. Divergence from our own root is AE's job to resolve,
+        // never grounds to dismantle topology.
+        // Facts gathered UP FRONT as owned values: `flag_questionable` needs
+        // &mut self, so no borrow of `self.branch_root_hashes` may be held
+        // across it.
+        let advertised_for_tick: Option<Hash256> = self
+            .branch_root_hashes
+            .get(&response.response_tick)
+            .and_then(|e| {
+                e.iter()
+                    .find(|(pk, _, _)| *pk == response.responder_pk)
+                    .map(|(_, r, _)| *r)
+            });
+        let distinct_advertised = self
+            .branch_root_hashes
+            .get(&response.response_tick)
+            .map(|e| {
+                let mut v: Vec<Hash256> = e.iter().map(|(_, r, _)| *r).collect();
+                v.sort_unstable();
+                v.dedup();
+                v.len()
+            })
+            .unwrap_or(0);
+        // STALENESS TEST (2026-08-07): did the responder ALREADY advertise the
+        // root it just answered with, at some other tick? If the answer matches
+        // an advertisement at a LATER tick, the responder had simply moved on —
+        // the "contradiction" is two snapshots of a moving target, not a lie.
+        // Purely local; needs no wire change. This is what separates the 18
+        // unexplained flags (advertised/answered/ours all different) into
+        // staleness vs real divergence.
+        let answered_seen_at: Option<u64> = self
+            .branch_root_hashes
+            .iter()
+            .filter(|(_, v)| {
+                v.iter()
+                    .any(|(pk, r, _)| *pk == response.responder_pk && *r == response.root_hash)
+            })
+            .map(|(t, _)| *t)
+            .max();
+        // COVERAGE (2026-08-07): `answered_seen_at = none` is ambiguous on its
+        // own — it means "we hold no record of that root", which is TRUE both
+        // when the responder never advertised it (real divergence) and when the
+        // advertisement simply never reached us or has aged out
+        // (branch_root_hashes retains ~20 ticks). Without coverage, `none` was
+        // being read as evidence of divergence when it may be evidence of our
+        // own gap. Report what we actually hold about this responder so the
+        // reader can tell the two apart:
+        //   adv_count   — advertisements retained from THIS responder
+        //   adv_after   — how many of those are at ticks LATER than the one
+        //                 answered. If we hold several later roots from this
+        //                 responder and the answer is none of them, "never
+        //                 advertised" is well-evidenced. If adv_after == 0 we
+        //                 simply cannot conclude.
+        let (adv_count, adv_after) = {
+            let mut count = 0usize;
+            let mut after = 0usize;
+            for (t, v) in self.branch_root_hashes.iter() {
+                for (pk, _, _) in v.iter() {
+                    if *pk == response.responder_pk {
+                        count += 1;
+                        if *t > response.response_tick {
+                            after += 1;
+                        }
+                    }
+                }
+            }
+            (count, after)
+        };
+
+        if let Some(advertised) = advertised_for_tick {
+            if advertised != response.root_hash && response.root_hash == our_root {
+                log::debug!(
+                    "[SELFCONTRA-EXONERATED] tick={} responder={:?} advertised={:?} \
+                     answered={:?} == our root — stale gossip, not a lie; staying attached",
+                    response.response_tick,
+                    &response.responder_pk[..4],
+                    &advertised[..4],
+                    &response.root_hash[..4]
+                );
+                self.audit_exonerated = self.audit_exonerated.saturating_add(1);
+            } else if advertised != response.root_hash {
+                log::warn!(
+                    "Audit: upstream SELF-CONTRADICTION at tick {}: advertised root {:?} but audit answered {:?} \
+                     | SELFCONTRA-DIAG proof_ok=true answered_eq_ours={} advertised_eq_ours={} \
+                     distinct_advertised_roots={} answered_seen_at_tick={} adv_count={} adv_after={} \
+                     our_tick={} responder={:?}",
+                    response.response_tick,
+                    &advertised[..4],
+                    &response.root_hash[..4],
+                    response.root_hash == our_root,
+                    advertised == our_root,
+                    distinct_advertised,
+                    answered_seen_at.map(|t| t as i64).unwrap_or(-1),
+                    adv_count,
+                    adv_after,
+                    self.current_tick,
+                    &response.responder_pk[..4]
+                );
+                // Self-contradiction: two statements signed by the SUSPECT —
+                // its audit answer and its own advertisement for the same tick.
+                // We retain the advertisement signature precisely so this is
+                // provable to a receiver rather than asserted.
+                let advertised_sig = self
+                    .branch_root_hashes
+                    .get(&response.response_tick)
+                    .and_then(|e| {
+                        e.iter()
+                            .find(|(pk, r, _)| {
+                                *pk == response.responder_pk && *r == advertised
+                            })
+                            .map(|(_, _, sig)| sig.clone())
+                    })
+                    .unwrap_or_default();
+                self.audit_selfcontra_flags = self.audit_selfcontra_flags.saturating_add(1);
+                return Ok(self.flag_questionable(
+                    response.responder_pk,
+                    signer,
+                    Some(QuestionableEvidence {
+                        audit_response: response.clone(),
+                        advertised_root: Some(advertised),
+                        advertised_sig,
+                    }),
+                ));
+            }
+        }
+
+        if response.root_hash != our_root {
+            // Honest divergence (or we simply lag the upstream). Leave the
+            // tree alone; anti-entropy converges the SMTs while attached —
+            // detaching here is what PREVENTED convergence.
+            log::debug!(
+                "Audit: upstream root {:?} differs from ours {:?} — divergence noted, not flagged (AE will converge)",
                 &response.root_hash[..4],
                 &our_root[..4]
             );
-
-            return Ok(self.flag_questionable(response.responder_pk, signer));
+        } else {
+            self.audit_pass_count += 1;
+            log::debug!(
+                "Audit passed (count: {}), root: {:?}",
+                self.audit_pass_count,
+                &our_root[..4]
+            );
         }
-
-        // Audit passed
-        self.audit_pass_count += 1;
         self.ticks_since_audit = 0;
-        log::debug!(
-            "Audit passed (count: {}), root: {:?}",
-            self.audit_pass_count,
-            &our_root[..4]
-        );
 
         Ok(TardisAction::None)
     }
@@ -846,7 +1504,15 @@ impl TardisNode {
     }
 
     /// Flag upstream as questionable and cascade alert to downstream.
-    fn flag_questionable(&mut self, suspect: PeerId, signer: &dyn Signer) -> TardisAction {
+    /// `evidence` is the suspect's own signed statements proving the
+    /// accusation. `None` means this node is re-minting on cascade and holds no
+    /// proof — receivers MUST NOT detach on such an alert.
+    fn flag_questionable(
+        &mut self,
+        suspect: PeerId,
+        signer: &dyn Signer,
+        evidence: Option<QuestionableEvidence>,
+    ) -> TardisAction {
         log::warn!(
             "Flagging upstream {:?} as QUESTIONABLE at tick {}",
             &suspect[..4],
@@ -857,21 +1523,30 @@ impl TardisNode {
         self.upstream_status = NodeStatus::Questionable;
 
         // 2. Build alert
-        let evidence_hash = blake3::hash(
-            &[
-                &self.current_tick.to_le_bytes()[..],
-                &suspect[..],
-                &self.my_pk[..],
-            ]
-            .concat(),
-        );
+        // Commit to the PROOF when we have one. The old hash covered
+        // (tick, suspect, reporter) — all already in the alert — so it proved
+        // nothing; it was a dedup key named "evidence". With evidence attached,
+        // the alert signature now covers the proof too.
+        let evidence_hash = match &evidence {
+            Some(ev) => crypto::evidence_commitment(ev),
+            None => *blake3::hash(
+                &[
+                    &self.current_tick.to_le_bytes()[..],
+                    &suspect[..],
+                    &self.my_pk[..],
+                ]
+                .concat(),
+            )
+            .as_bytes(),
+        };
 
         let mut alert = QuestionableAlert {
             suspect_pk: suspect,
             reporter_pk: self.my_pk,
             tick: self.current_tick,
-            evidence_hash: *evidence_hash.as_bytes(),
+            evidence_hash,
             signature: vec![], // filled below
+            evidence,
         };
         alert.signature = signer.sign(&crypto::alert_sign_payload(&alert));
 
@@ -881,7 +1556,7 @@ impl TardisNode {
         let _ = self.record_alert_seen(Self::alert_seen_key(&alert));
 
         // 3. Disconnect from upstream
-        self.up = None;
+        self.clear_upstream("flag_questionable");
         self.upstream_status = NodeStatus::Disconnected;
         self.audit_pass_count = 0;
 
@@ -933,6 +1608,10 @@ impl TardisNode {
             tick: self.current_tick,
             evidence_hash: *evidence_hash.as_bytes(),
             signature: vec![],
+            // Re-minted on cascade: this node did not audit the suspect itself,
+            // so it holds no proof. `None` means "unproven" and a receiver MUST
+            // NOT detach on it.
+            evidence: None,
         };
         alert.signature = signer.sign(&crypto::alert_sign_payload(&alert));
         if !self.record_alert_seen(Self::alert_seen_key(&alert)) {
@@ -1010,9 +1689,26 @@ impl TardisNode {
             alert.tick
         );
 
-        // If the suspect is our upstream, disconnect
+        // If the suspect is our upstream, disconnect — BUT ONLY ON PROOF.
+        //
+        // CONTRACT: `alert.evidence` is present only when the node layer has
+        // VERIFIED it against the suspect's NBC-anchored key
+        // (`crypto::verify_questionable_evidence`); it strips the field when the
+        // proof fails or is absent. Same contract as `record_branch_root_hash`:
+        // TardisNode holds no keys, so authentication happens at the edge and
+        // this layer treats presence as proven.
+        //
+        // Previously this detached on the reporter's word alone, so one
+        // accusation dismantled the suspect's whole subtree — and the
+        // accusation itself could be generated from an unsigned TickHash. An
+        // unproven alert still CASCADES (a warning is worth propagating to
+        // nodes that can audit the suspect themselves); it just may not
+        // dismantle topology.
         if self.up.map(|u| u == alert.suspect_pk).unwrap_or(false) {
-            return self.flag_questionable(alert.suspect_pk, signer);
+            if alert.evidence.is_some() {
+                return self.flag_questionable(alert.suspect_pk, signer, alert.evidence.clone());
+            }
+            self.alerts_unproven_ignored = self.alerts_unproven_ignored.saturating_add(1);
         }
 
         // Otherwise just cascade the alert downward
@@ -1074,8 +1770,25 @@ impl TardisNode {
 
     // ── Slot Management ──
 
-    /// Set upstream connection.
+    /// Set upstream connection (a real D seat at `peer`).
+    #[track_caller]
     pub fn set_upstream(&mut self, peer: PeerId) {
+        self.attach_upstream(peer, NodeStatus::Connected);
+    }
+
+    /// YPX-003 §2.1 step 2 (KI#48, RULED 2026-09-25) — PARK in `peer`'s P
+    /// slot. `up` becomes the host so its ticks are received and validated
+    /// exactly like a D child's (`process_tick` checks only `up`), but the
+    /// status is `Pending`, so `has_upstream()` / `needs_parent()` /
+    /// `is_self_writer()` all read "still seeking". ONE builder with
+    /// `set_upstream` (RULE 1): the status is the only difference.
+    #[track_caller]
+    pub fn set_upstream_pending(&mut self, peer: PeerId) {
+        self.attach_upstream(peer, NodeStatus::Pending);
+    }
+
+    #[track_caller]
+    fn attach_upstream(&mut self, peer: PeerId, status: NodeStatus) {
         // Cycle prevention: never set a downstream child as our upstream
         if self.d1.as_ref() == Some(&peer) || self.d2.as_ref() == Some(&peer) {
             log::warn!("Cycle prevented: attempted to set downstream {:?} as upstream", &peer[..4]);
@@ -1086,11 +1799,34 @@ impl TardisNode {
             return;
         }
         self.up = Some(peer);
-        self.upstream_status = NodeStatus::Connected;
+        self.upstream_status = status;
         self.audit_pass_count = 0;
         self.ticks_since_audit = 0;
         self.ticks_with_current_parent = 0;
-        log::info!("Upstream set to {:?}", &peer[..4]);
+        log::info!(
+            "[TARDIS-UP-SET] up={:?} status={:?} caller={}",
+            &peer[..4],
+            status,
+            std::panic::Location::caller()
+        );
+    }
+
+    /// THE ONE "parked" predicate (YPX-003 §2.1 RULED 2026-09-25): this node
+    /// sits in a host's P slot — a tick source, not a tree seat. The
+    /// orphan-recovery loop (`needs_parent()`), the writer predicate
+    /// (`is_self_writer()`) and the origin gate (`has_tick_source()`) all
+    /// derive from `upstream_status`; nothing else may test `Pending`.
+    pub fn is_parked(&self) -> bool {
+        self.up.is_some() && self.upstream_status == NodeStatus::Pending
+    }
+
+    /// Does this node RECEIVE ticks from someone — a D parent OR a P host?
+    /// Gates self-origination in the tick loop: a parked node must not
+    /// generate its own tick on top of the host's (the two would collide in
+    /// `process_tick`'s replay bound). Distinct from `has_upstream()`, which
+    /// means "seated" and stays false while parked.
+    pub fn has_tick_source(&self) -> bool {
+        self.has_upstream() || self.is_parked()
     }
 
     /// Add a downstream child. Returns false if both D slots are full.
@@ -1141,9 +1877,12 @@ impl TardisNode {
     }
 
     /// Remove a peer from all slots.
+    #[track_caller]
     pub fn remove_peer(&mut self, peer: &PeerId) {
         if self.up.as_ref() == Some(peer) {
-            self.up = None;
+            // KI#48: every clear of `up` must say why — the orphan
+            // oscillation was invisible because this path had no log.
+            self.clear_upstream("remove_peer");
             self.upstream_status = NodeStatus::Disconnected;
         }
         if self.d1.as_ref() == Some(peer) {
@@ -1163,6 +1902,7 @@ impl TardisNode {
     /// Used when child goes offline (death/disconnect) — NOT for voluntary
     /// detach (rotation, rebalance). The original child can reclaim the slot
     /// immediately; other nodes must wait until reservation expires.
+    #[track_caller]
     pub fn remove_peer_reserved(&mut self, peer: &PeerId, current_tick: u64) {
         if self.d1.as_ref() == Some(peer) {
             self.d1_reserved = Some((*peer, current_tick));
@@ -1176,7 +1916,7 @@ impl TardisNode {
         }
         // UP and P don't get reservations
         if self.up.as_ref() == Some(peer) {
-            self.up = None;
+            self.clear_upstream("remove_peer_reserved");
             self.upstream_status = NodeStatus::Disconnected;
         }
         if self.pending.as_ref() == Some(peer) {
@@ -1366,6 +2106,8 @@ impl TardisNode {
         self.silent_parent_ticks = self.silent_parent_ticks.saturating_add(1);
         if self.silent_parent_ticks >= SILENT_PARENT_THRESHOLD {
             self.silent_parent_ticks = 0;
+            // Counted here, where the reason is known — see the grandpa site.
+            self.orphan_causes.detach_silent_parent += 1;
             return Some(TardisAction::DetachUpstream {
                 parent,
                 reason: DetachReason::SilentParent,
@@ -1394,6 +2136,14 @@ impl TardisNode {
     /// Returns true if this node has no upstream and needs to find a parent.
     /// This applies to ALL nodes equally — genesis, seed, or regular.
     /// A node that has lost its parent must find a new one to get approval.
+    ///
+    /// YPX-003 §2.1 (KI#48, RULED 2026-09-25): a PARKED node (`is_parked()`)
+    /// also needs a parent — P is transitional, and this staying TRUE is what
+    /// keeps it seeking a real D slot through `SlotAvailable` hints and the
+    /// two-pass relax. The 08-01 grant set `Connected` here, `needs_parent()`
+    /// went false, and a cold-started mesh parked every node and produced no
+    /// writers. `has_upstream()` is `Connected`-only, so this needs no extra
+    /// clause — but it is the reason that predicate must not widen.
     pub fn needs_parent(&self) -> bool {
         !self.has_upstream()
     }
@@ -1449,34 +2199,124 @@ impl TardisNode {
 
     // ── Sender → Writer Routing (§1.2.1, §2.16) ──
 
-    /// Check if this node is a qualified WRITER (dc=2, has 2 downstream approvals).
+    /// Check if this node is a qualified WRITER.
     /// Writers can record transactions. Readers redirect to writers.
+    ///
+    /// YPX-003 "Per-tick write qualification (NORMATIVE)" requires all three of:
+    ///   1. downstream_count == 2
+    ///   2. has_upstream == true
+    ///   3. approved the upstream's tick this interval
+    ///
+    /// Condition 2 is enforced here (KI#69). It was previously absent, which let
+    /// an ORPHAN qualify as a writer: the spec is explicit that "a writer without
+    /// upstream is a candidate writer still searching; it does not yet have
+    /// authority." An orphan that believes it is a writer adjudicates
+    /// registrations against its own stale SMT head and tells a CORRECT wallet it
+    /// has diverged — see KI#69 for the traced incident.
+    ///
+    /// Condition 3 is ENFORCED again as of 2026-08-18 (design decision), restoring full
+    /// spec compliance. It had been switched off on 2026-08-05 on the grounds
+    /// that "TCP approval jitter" made the role flicker and blocked Nabla
+    /// registration. **That diagnosis is now believed wrong.** The jitter it was
+    /// reacting to is far better explained by the address defect fixed in
+    /// `a1aa1ad7`: nabla resolved its own `--advertise` name at boot and
+    /// gossiped the resulting IP, so nodes held unroutable addresses for their
+    /// peers and dropped approvals wholesale — `[APPROVAL-UNSENT] cannot resolve
+    /// upstream … approval DROPPED`, which is exactly what flickering approval
+    /// liveness looks like from the inside. Turning the condition off treated
+    /// the symptom of a transport bug as a property of TCP.
+    ///
+    /// Note this reads OUR OWN emitted approval (`last_approved_upstream_tick`),
+    /// not our children's — it cannot be starved by a peer, only by us failing
+    /// to process a tick, which is the exact liveness the spec is asking about.
+    ///
+    /// ⚠ If writer flicker DOES reappear under load, do not simply switch this
+    /// off again: capture which node stopped approving and why first. The whole
+    /// point of the 2026-08-05 regression is that the off-switch hid the cause.
+    ///
+    /// `downstream_count() >= 2` is retained rather than the spec's `== 2`: the
+    /// two are equivalent here because d1/d2 are two `Option<PeerId>` fields, so
+    /// dc > 2 is unreachable by type, and `add_downstream` refuses a third child.
     pub fn is_self_writer(&self) -> bool {
-        // Writer = has 2 downstream children (structural property of the TARDIS tree).
-        // prev_round_approval_count tracks liveness (child responsiveness) and is used
-        // for downstream rotation decisions, but does NOT gate writer status.
-        // A dc=2 node IS a writer by topology — approval jitter in TCP mode should not
-        // cause writer status to flicker, which blocks Nabla registration.
-        self.downstream_count() >= 2
+        // YPX-003 §2.1 (KI#48, RULED 2026-09-25): P is NEVER a writer input.
+        // A parked node fails condition 2 (`has_upstream()` is Connected-only,
+        // so `is_parked()` ⇒ not a writer), and a host's P child is never in
+        // `downstream_count()` (d1/d2 only) — so a mesh of parked nodes forms
+        // writers only through real D attaches, which the 08-01 stall proved
+        // necessary. Both halves are asserted by `p_slot_never_counts_toward_
+        // writer`.
+        // GUIDE §5.6a — DEMOTE, don't disconnect. When our peers do not all
+        // observe the same source address for us, we serve as a READ node: still
+        // gossiping, running AE, relaying ticks and propagating peers, but not
+        // accepting client writes. Gating it HERE (not at the call sites) means
+        // `writer_routing()` inherits it for free — one predicate, one owner
+        // (RULE 1). Registrations then take the existing REDIRECT path, so a
+        // client is handed to a node that can write rather than refused.
+        !self.address_disputed
+            && self.downstream_count() >= 2
+            && self.has_upstream()
+            && self.last_approved_upstream_tick == self.current_tick
     }
 
-    /// Returns the upstream parent PeerId if this node is a READER and needs
-    /// to redirect a transaction sender to a writer. Walk upstream until finding
-    /// a writer (dc=2 node). Maximum one extra hop in a healthy tree.
+    /// `/status` slot label + writer flag — from the SAME predicate the register
+    /// door routes on (`is_self_writer` → `writer_routing`). RULE 6 (2026-10-01): the
+    /// status used `downstream_count() == 2` alone, so a node with two children whose
+    /// upstream had not approved this tick (or whose address was disputed) read
+    /// "Writer" while its door answered `reader_redirect` — the fork gate picked such
+    /// "writers" as doors four times and never built its fork.
+    pub fn writer_status(&self) -> (bool, String) {
+        let w = self.is_self_writer();
+        let label = if self.has_upstream() {
+            if w { "Writer".to_string() } else { format!("D{}", self.downstream_count()) }
+        } else if self.is_parked() {
+            "Parked".to_string()
+        } else {
+            "Orphan".to_string()
+        };
+        (w, label)
+    }
+
+    /// GUIDE §5.6a — set by the node when peer address observations disagree.
+    /// Separate from the operator's `reader_only` on purpose: an operator
+    /// clearing their own flag must never clear a security demotion.
+    pub fn set_address_disputed(&mut self, disputed: bool, report_count: usize) {
+        self.address_disputed = disputed;
+        self.address_report_count = report_count;
+    }
+
+    pub fn address_report_count(&self) -> usize {
+        self.address_report_count
+    }
+
+    pub fn address_disputed(&self) -> bool {
+        self.address_disputed
+    }
+
+    /// Where should a registration received by this node be handled? (KI#69)
     ///
-    /// Returns:
-    ///   - None → this node IS a writer (handle locally)
-    ///   - Some(parent_pk) → redirect sender to this parent
+    /// This replaces `find_nearest_writer() -> Option<PeerId>`, whose two-valued
+    /// return could not distinguish three distinct states. `None` meant BOTH "I
+    /// am the writer, handle locally" AND "I am an orphan with no parent" —
+    /// because `self.up` is `None` for an orphan. Every caller read the second as
+    /// the first and processed the registration locally.
     ///
-    /// In production, the parent is the most likely writer (it has us + sibling
-    /// as children → dc=2). If parent is also a reader (dc=1), the transaction
-    /// follows the chain up. The caller tracks hop count to prevent loops.
-    pub fn find_nearest_writer(&self) -> Option<PeerId> {
+    /// The three states are now explicit, and `NoWriterKnown` is NOT a licence to
+    /// answer: a node that cannot locate a writer must not answer a question only
+    /// a writer can answer.
+    pub fn writer_routing(&self) -> WriterRouting {
         if self.is_self_writer() {
-            return None; // We ARE a writer — handle locally
+            WriterRouting::IAmWriter
+        } else if let Some(parent) = self.up {
+            // Reader with an anchor: redirect upward. In production the parent is
+            // the most likely writer (it has us + sibling as children → dc=2). If
+            // the parent is also a reader, the sender follows the chain up; the
+            // caller tracks hop count to prevent loops.
+            WriterRouting::RedirectTo(parent)
+        } else {
+            // Orphan. Structurally unable to know the current writer, and its own
+            // SMT head may be arbitrarily stale.
+            WriterRouting::NoWriterKnown
         }
-        // Redirect to upstream parent (most likely a writer)
-        self.up
     }
 
     // ── Rebalancing (§2.2 extension) ──
@@ -1541,6 +2381,14 @@ impl TardisNode {
 
     /// Record whether each child approved this tick. Called by network layer
     /// after tick processing completes. Tracks cumulative misses per child.
+    /// Convenience wrapper for callers with no subtree-D figures to report.
+    ///
+    /// ⚠ ghost audit G17: this was the ONLY caller of
+    /// `record_child_approvals_with_subtree`, and it always passed `0, 0` — so
+    /// the §2.14.5 subtree-D aggregation never aggregated anything and
+    /// `subtree_open_d` had no production read site. A caller that HAS the
+    /// children's reported figures (they ride on `TickApproval.subtree_open_d`)
+    /// must call the extended form directly, or the aggregation stays dead.
     pub fn record_child_approvals(&mut self, d1_approved: bool, d2_approved: bool) {
         self.record_child_approvals_with_subtree(d1_approved, d2_approved, 0, 0);
     }
@@ -1580,31 +2428,32 @@ impl TardisNode {
     ///   - PARENT_ROTATION_INTERVAL + per-node jitter ticks have elapsed
     ///   - At least one child has missed approvals
     ///
-    /// Ghost-child escape hatch (beta10 fix): if the node has exactly ONE
-    /// child and that child has missed approvals for `GHOST_CHILD_MISS_THRESHOLD`
-    /// consecutive ticks, drop it immediately — no interval gating. Without
-    /// this a parent with {d1=ghost, d2=None} would forward ticks to the
-    /// ghost forever because the main rotation path requires both slots to
-    /// be filled. Discovered in the 2026-04-13 soak: 3 parents were spamming
-    /// 6,500+ rejected ticks at 3 ghost children over ~3 hours.
+    /// Ghost-child handling (beta10 fix, 2026-04-13 soak: 3 parents spamming
+    /// 6,500+ rejected ticks at 3 ghost children over ~3 hours): a parent with
+    /// {d1=ghost, d2=None} must not forward ticks to the ghost forever, because
+    /// the main rotation path requires both slots to be filled.
+    ///
+    /// That case is handled by the STALE-CHILD SLOT rule below, which fires at
+    /// 20 misses and does not require both slots. The separate 100-miss
+    /// "ghost-child escape hatch" that used to sit above it was UNREACHABLE and
+    /// has been deleted — see the note in the body (ghost audit G12).
     pub fn wants_drop_slow_child(&mut self) -> Option<PeerId> {
-        // Ghost-child escape hatch: single-child node with a non-responsive child.
-        // 2026-05-28: bumped from 10 to 100 ticks (~8min @5s ticks) alongside
-        // `WRITER_GRACE_TICKS` for the same reason — KI#18 made TARDIS load-
-        // bearing, and 10 ticks was too aggressive against transient drift.
-        const GHOST_CHILD_MISS_THRESHOLD: u32 = 100; // ~8min of misses
-        if self.d1.is_some() && self.d2.is_none() && self.d1_misses >= GHOST_CHILD_MISS_THRESHOLD {
-            let dropped = self.d1;
-            self.d1 = None;
-            self.d1_misses = 0;
-            return dropped;
-        }
-        if self.d2.is_some() && self.d1.is_none() && self.d2_misses >= GHOST_CHILD_MISS_THRESHOLD {
-            let dropped = self.d2;
-            self.d2 = None;
-            self.d2_misses = 0;
-            return dropped;
-        }
+        // ── ghost audit G12: the ghost-child escape hatch is DELETED ──────
+        //
+        // It required `d1_misses >= GHOST_CHILD_MISS_THRESHOLD` (100, bumped
+        // from 10 on 2026-05-28). But the stale-child slot rule immediately
+        // below fires at `STALE_CHILD_SLOT_THRESHOLD` (20) and RESETS the miss
+        // counter — and it covers the single-child case too, since it does not
+        // require both slots filled. So misses could never reach 100: the
+        // branch was unreachable and `reason=ghost` never appeared in any log.
+        //
+        // Deleted rather than re-thresholded: its purpose (drop a
+        // non-responsive child on a single-child node) is fully served by the
+        // stale-slot rule, five times faster. The two rules were added a month
+        // apart to solve the same symptom; the later one silently superseded
+        // the earlier. Behaviour is unchanged by this deletion — a dead branch
+        // cannot have been doing anything. RULE 3: delete it, do not leave it
+        // reading as an active escape hatch.
 
         // Stale-child slot cleanup (dc=2 case) — symmetric to the child-side
         // silent-parent detection. Drop a specific slot immediately when its
@@ -1621,12 +2470,16 @@ impl TardisNode {
         // the rotation interval.
         if self.d1.is_some() && self.d1_misses >= STALE_CHILD_SLOT_THRESHOLD {
             let dropped = self.d1;
+            log::info!("[TARDIS-DROP-CHILD] d1={:?} reason=stale-slot misses={}",
+                dropped.as_ref().map(|p| &p[..4]), self.d1_misses);
             self.d1 = None;
             self.d1_misses = 0;
             return dropped;
         }
         if self.d2.is_some() && self.d2_misses >= STALE_CHILD_SLOT_THRESHOLD {
             let dropped = self.d2;
+            log::info!("[TARDIS-DROP-CHILD] d2={:?} reason=stale-slot misses={}",
+                dropped.as_ref().map(|p| &p[..4]), self.d2_misses);
             self.d2 = None;
             self.d2_misses = 0;
             return dropped;
@@ -1649,10 +2502,14 @@ impl TardisNode {
         // Drop the child with more misses
         if self.d1_misses >= self.d2_misses {
             let dropped = self.d1;
+            log::info!("[TARDIS-DROP-CHILD] d1={:?} reason=rotation misses={}",
+                dropped.as_ref().map(|p| &p[..4]), self.d1_misses);
             self.d1_misses = 0;
             dropped
         } else {
             let dropped = self.d2;
+            log::info!("[TARDIS-DROP-CHILD] d2={:?} reason=rotation misses={}",
+                dropped.as_ref().map(|p| &p[..4]), self.d2_misses);
             self.d2_misses = 0;
             dropped
         }
@@ -1735,40 +2592,6 @@ impl TardisNode {
         age <= TICK_INTERVAL_SECS
     }
 
-    /// Full tick validation including writer proof.
-    ///
-    /// Checks both time validity AND that the parent is a qualified WRITER
-    /// (has >= 2 downstream approvals). A tick from a non-writer parent is
-    /// rejected — the child must find a new parent that can produce
-    /// legitimate ticks.
-    ///
-    /// No exemptions — a seed is the same as every other Nabla.
-    ///
-    /// Returns `TickValidation` indicating accept, reject-time, or reject-writer.
-    pub fn validate_parent_tick_full(
-        &self,
-        parent_tick: u64,
-        my_time: u64,
-        parent_downstream_approvals: u8,
-    ) -> TickValidation {
-        // Time check first
-        if parent_tick > my_time {
-            return TickValidation::RejectFuture;
-        }
-        let age = my_time.saturating_sub(parent_tick);
-        if age > TICK_INTERVAL_SECS {
-            return TickValidation::RejectStale;
-        }
-
-        // Writer check: parent must have >= 2 approvals to produce legitimate ticks.
-        // No exemptions — seeds earn approvals like everyone else.
-        if !Self::is_writer(parent_downstream_approvals as usize) {
-            return TickValidation::RejectNotWriter;
-        }
-
-        TickValidation::Accept
-    }
-
     // ── Writer Status (YPX-003 §1.5) ──
 
     /// Returns true if this node qualifies as a WRITER.
@@ -1795,7 +2618,11 @@ impl TardisNode {
     ///   - `DetachChildren` — timeout expired. Caller MUST detach both
     ///     children so all three nodes can recover independently.
     pub fn check_parentless_timeout(&mut self) -> ParentlessAction {
-        if self.has_upstream() {
+        // A PARKED node (YPX-003 §2.1, KI#48) relays its host's ticks to its
+        // children, so its subtree is not a zombie: it counts as having a
+        // parent HERE (tick liveness), while `needs_parent()` still says it
+        // must keep seeking a D seat. `has_tick_source` is that distinction.
+        if self.has_tick_source() {
             // Has parent — all good
             self.parentless_ticks = 0;
             return ParentlessAction::Ok;
@@ -1868,10 +2695,115 @@ impl TardisNode {
 
     /// Detach from current upstream. Returns the old parent's PeerId
     /// so the caller can also clean up the parent's D slot.
+    #[track_caller]
     pub fn detach_upstream(&mut self) -> Option<PeerId> {
-        let parent = self.up.take();
+        let parent = self.clear_upstream("detach_upstream");
         self.upstream_status = NodeStatus::Disconnected;
         parent
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CANONICAL upstream-clear funnel
+    //
+    //  ⚠ THIS IS THE ONE TO USE. Need to drop `up` for a new reason? Call
+    //  `clear_upstream(via)`. Do NOT write `self.up = None` again.
+    //
+    //  There were FOUR copies of "log [TARDIS-UP-CLEAR] then self.up = None"
+    //  (flag_questionable, remove_peer, remove_peer_reserved, detach_upstream)
+    //  — four builders for one fact. They are now one. A fifth copy would go
+    //  uncounted in `orphan_causes` and nothing would fail loudly.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Clear `up`, log why, and count the path. Returns the dropped parent.
+    ///
+    /// `via` appears verbatim in `[TARDIS-UP-CLEAR] ... via=<via>` — KI#48
+    /// established that every clear must say why, because the orphan
+    /// oscillation was invisible while one path had no log.
+    fn clear_upstream(&mut self, via: &str) -> Option<PeerId> {
+        let prev = self.up.take();
+        if let Some(p) = &prev {
+            log::info!(
+                "[TARDIS-UP-CLEAR] up={:?} via={} caller={}",
+                &p[..4],
+                via,
+                std::panic::Location::caller()
+            );
+            match via {
+                // detach_upstream is only reached from the DetachUpstream action
+                // (grandpa-tick missing / silent parent) — always FORCED.
+                "detach_upstream" => {
+                    self.orphan_causes.via_detach_upstream += 1;
+                    self.orphan_causes.intent_forced += 1;
+                }
+                "remove_peer" => self.orphan_causes.via_remove_peer += 1,
+                "remove_peer_reserved" => self.orphan_causes.via_remove_peer_reserved += 1,
+                "flag_questionable" => {
+                    self.orphan_causes.via_flag_questionable += 1;
+                    self.orphan_causes.intent_forced += 1;
+                }
+                // A new caller that forgot to add a bucket. Loud, not silent.
+                other => log::warn!("[TARDIS-UP-CLEAR] uncounted via={other} — add a bucket to OrphanCauseCounters"),
+            }
+        }
+        prev
+    }
+
+    /// Orphan-cause counters for /status and diagnostics.
+    pub fn orphan_causes(&self) -> &OrphanCauseCounters {
+        &self.orphan_causes
+    }
+
+    /// Mark the NEXT upstream loss as VOLUNTARY (KI#71). Called by the §2.2
+    /// rebalance path immediately before it drops its parent to move.
+    ///
+    /// Intent is counted at the SITE THAT DECIDES, because `clear_upstream`
+    /// cannot tell a chosen move from a forced one — `remove_peer` serves both.
+    /// Counting by call site is what made 103 healthy self-optimisation moves
+    /// read as a doubled fault.
+    pub fn note_voluntary_move(&mut self) {
+        self.orphan_causes.intent_voluntary = self.orphan_causes.intent_voluntary.saturating_add(1);
+    }
+
+    /// Count of self-contradiction flags suppressed by the exonerate-only guard.
+    /// Audit responses refused for coming from a node that is not our upstream.
+    pub fn audit_responses_unauthorized(&self) -> u64 {
+        self.audit_responses_unauthorized
+    }
+
+    /// Audit responses that matched no pending challenge.
+    pub fn audit_responses_unmatched(&self) -> u64 {
+        self.audit_responses_unmatched
+    }
+
+    /// Pin the private audit entropy. Tests only — production seeds from the
+    /// OS RNG in `new()`, and the seed must never be settable from the wire.
+    #[cfg(test)]
+    pub fn set_audit_seed(&mut self, seed: [u8; 32]) {
+        self.audit_seed = seed;
+    }
+
+    pub fn audit_exonerated(&self) -> u64 {
+        self.audit_exonerated
+    }
+
+    /// The §5.5 audit counters, for /status (RULE 3 §2: a check that cannot be
+    /// observed running reads the same as a dead one). `selfcontra_flags`
+    /// isolates the SELF-CONTRADICTION conviction that `orphan_causes`
+    /// `via_flag_questionable` mixes with the merkle-proof and cascade causes.
+    pub fn audit_counters(&self) -> [(&'static str, u64); 6] {
+        [
+            ("responses_unauthorized", self.audit_responses_unauthorized),
+            ("responses_unmatched", self.audit_responses_unmatched),
+            ("response_stale", self.audit_response_stale),
+            ("selfcontra_flags", self.audit_selfcontra_flags),
+            ("requests_shed", self.audit_requests_shed),
+            ("exonerated", self.audit_exonerated),
+        ]
+    }
+
+    /// Alerts naming our upstream that were ignored for lack of proof.
+    pub fn alerts_unproven_ignored(&self) -> u64 {
+        self.alerts_unproven_ignored
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1880,11 +2812,19 @@ impl TardisNode {
 
     /// Record a root hash from another branch (received via TickHash gossip).
     /// Returns true if a fork is detected (same tick, different root hash).
-    pub fn record_branch_root_hash(&mut self, tick: u64, sender_pk: PeerId, root_hash: Hash256) -> bool {
+    /// `signature` MUST already have been verified against the sender's
+    /// NBC-anchored key by the caller — this only retains it as evidence.
+    pub fn record_branch_root_hash(
+        &mut self,
+        tick: u64,
+        sender_pk: PeerId,
+        root_hash: Hash256,
+        signature: Vec<u8>,
+    ) -> bool {
         let entries = self.branch_root_hashes.entry(tick).or_default();
         // Check for conflict: same tick, different root hash from a different sender
-        let fork_detected = entries.iter().any(|(_, rh)| *rh != root_hash);
-        entries.push((sender_pk, root_hash));
+        let fork_detected = entries.iter().any(|(_, rh, _)| *rh != root_hash);
+        entries.push((sender_pk, root_hash, signature));
         // Prune old entries (keep last 20 ticks)
         if self.branch_root_hashes.len() > 20 {
             let cutoff = tick.saturating_sub(20);
@@ -1893,167 +2833,19 @@ impl TardisNode {
         fork_detected
     }
 
-    /// Enter merge quarantine. Called when fork is detected.
-    /// Phase 1 (PAUSE): immediately freeze conflicted wallets.
-    pub fn enter_merge_quarantine(&mut self, forked_wallet: Option<WalletId>) {
-        if !self.merge_quarantine_active {
-            self.merge_quarantine_active = true;
-            self.merge_quarantine_start_tick = self.current_tick;
-            log::warn!("∇ §32 MERGE QUARANTINE entered at tick {}", self.current_tick);
-        }
-        if let Some(wid) = forked_wallet {
-            if !self.merge_forked_wallets.contains(&wid) {
-                self.merge_forked_wallets.push(wid);
-            }
-        }
-    }
-
-    /// Return the list of wallets that triggered quarantine (confirmed forks).
-    pub fn forked_wallets(&self) -> &[WalletId] {
-        &self.merge_forked_wallets
-    }
-
-    /// Clear the forked wallets list (called after resolve_merge).
-    pub fn clear_forked_wallets(&mut self) {
-        self.merge_forked_wallets.clear();
-    }
-
-    /// Check if merge quarantine is active.
-    pub fn is_in_quarantine(&self) -> bool {
-        self.merge_quarantine_active
-    }
-
-    /// Check quarantine duration and resolve if expired.
-    /// Returns true if quarantine just expired (Phase 3: RESOLVE).
-    pub fn check_quarantine_expiry(&mut self) -> bool {
-        if !self.merge_quarantine_active {
-            return false;
-        }
-        let elapsed = self.current_tick.saturating_sub(self.merge_quarantine_start_tick);
-        if elapsed >= crate::constants::MERGE_QUARANTINE_TICKS {
-            self.merge_quarantine_active = false;
-            log::info!("∇ §32 MERGE QUARANTINE expired at tick {} (duration: {} ticks)",
-                self.current_tick, elapsed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Phase 2 (SCAN): Detect conflicted wallets between two SMTs.
-    /// Compares local SMT against a remote state snapshot.
-    /// Returns list of wallet_ids with conflicting state_ids.
-    pub fn detect_forked_wallets(
-        local_smt: &SparseMerkleTree,
-        remote_entries: &[(WalletId, StateId)],
-    ) -> Vec<WalletId> {
-        let mut forked = Vec::new();
-        for (wid, remote_state) in remote_entries {
-            if let Some(local_entry) = local_smt.get(wid) {
-                if local_entry.current_state != *remote_state {
-                    forked.push(*wid);
-                }
-            }
-            // Wallets only in one partition are unaffected (§32.8, Invariant 5)
-        }
-        forked
-    }
-
-    /// Phase 2 (SCAN): Propagate taint downstream through state-ID graph.
-    /// Given a set of forked wallet_ids, find all wallets whose state references
-    /// a tainted state_id (recursive and exhaustive per §32.8, Invariant 3).
-    pub fn propagate_taint(
-        smt: &SparseMerkleTree,
-        forked_wallets: &[WalletId],
-    ) -> Vec<WalletId> {
-        use std::collections::HashSet;
-
-        let mut tainted_wids: HashSet<WalletId> = HashSet::new();
-        let mut tainted_states: HashSet<StateId> = HashSet::new();
-
-        // Seed: forked wallets' current_state values are tainted
-        for wid in forked_wallets {
-            if let Some(entry) = smt.get(wid) {
-                tainted_states.insert(entry.current_state);
-            }
-        }
-
-        // BFS: expand taint until convergence (§32.3 recursive and exhaustive)
-        loop {
-            let mut new_tainted = Vec::new();
-            for entry in smt.entries().values() {
-                if forked_wallets.contains(&entry.wallet_id) {
-                    continue; // Skip the forked wallets themselves
-                }
-                if tainted_wids.contains(&entry.wallet_id) {
-                    continue; // Already tainted
-                }
-                if tainted_states.contains(&entry.tx_hash) {
-                    new_tainted.push(entry.clone());
-                }
-            }
-            if new_tainted.is_empty() {
-                break;
-            }
-            for entry in &new_tainted {
-                tainted_wids.insert(entry.wallet_id);
-                tainted_states.insert(entry.current_state);
-            }
-        }
-
-        tainted_wids.into_iter().collect()
-    }
-
-    /// Phase 3 (RESOLVE): Forked wallets → BANNED. Tainted (innocent) → Normal.
-    ///
-    /// Forked wallets committed the double-spend → permanent ban.
-    /// Tainted wallets received from forked source → restored to Normal.
-    /// Their FACT links from tainted inputs remain scarred (no nabla_confirmation).
-    ///
-    /// NOTE(review): Tainted wallets are spared. Their scarred FACT links track
-    /// the tainted lineage. Revisit if collusion becomes a concern.
-    ///
-    /// Returns the list of wallets that were banned (forked only).
-    pub fn resolve_merge(
-        smt: &mut SparseMerkleTree,
-        forked_wallets: &[WalletId],
-        tainted_wallets: &[WalletId],
-    ) -> Vec<WalletId> {
-        let mut banned = Vec::new();
-        // Forked wallets → BANNED (they double-spent)
-        for wid in forked_wallets {
-            if let Some(entry) = smt.get(wid) {
-                let mut updated = entry.clone();
-                updated.status = WalletStatus::Banned;
-                smt.put(&updated);
-                banned.push(*wid);
-            }
-        }
-        // Tainted wallets → restored to Normal (innocent downstream)
-        for wid in tainted_wallets {
-            if let Some(entry) = smt.get(wid) {
-                let mut updated = entry.clone();
-                updated.status = WalletStatus::Normal;
-                smt.put(&updated);
-                log::info!("§32 RESUME: tainted wallet {:02x}{:02x}... restored to Normal",
-                    wid[0], wid[1]);
-            }
-        }
-        banned
-    }
-
-    /// Freeze a specific wallet (Phase 1: immediate freeze on fork detection).
-    pub fn freeze_wallet(smt: &mut SparseMerkleTree, wallet_id: &WalletId) -> bool {
-        if let Some(entry) = smt.get(wallet_id) {
-            if entry.status == WalletStatus::Normal {
-                let mut updated = entry.clone();
-                updated.status = WalletStatus::Frozen;
-                smt.put(&updated);
-                return true;
-            }
-        }
-        false
-    }
+    // ForkSettlement §9r-E4 (owner ruling 2026-10-01, built 2026-10-02) —
+    // DELETED here: `enter_merge_quarantine`, `forked_wallets`,
+    // `clear_forked_wallets`, `is_in_quarantine`, `check_quarantine_expiry`
+    // (the 75 s §32 timer, D-E4-1), `detect_forked_wallets` (the §32 SCAN —
+    // a ghost: its one caller compared the head with itself), `propagate_taint`,
+    // `resolve_merge`, `freeze_wallet` and `taint_wallet`. Nothing in
+    // production writes `Frozen` / `Tainted` any more (source gate
+    // `fork_detection_mesh::e4_d_no_view_based_status_writer`). A fork is A1
+    // (`ban::apply_fork_verdict`); a downstream hold is A5 (`provenance.rs`).
+    // `is_wallet_blocked` stays: `Banned` (A1) blocks, and a restored LEGACY
+    // `Frozen`/`Tainted` leaf keeps blocking with no exit — counted by
+    // `status_unbacked_at_load`, required to be 0 by the pre-deploy gate
+    // (D-E4-2: stop and ask the owner, never normalise at load).
 
     /// Check if a wallet is frozen or banned (no transactions allowed).
     pub fn is_wallet_blocked(smt: &SparseMerkleTree, wallet_id: &WalletId) -> bool {
@@ -2074,24 +2866,75 @@ pub enum ParentlessAction {
     DetachChildren,
 }
 
-/// Result of `validate_parent_tick_full()`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TickValidation {
-    /// Tick is valid — time ok, parent is a qualified writer.
-    Accept,
-    /// Tick is in the future — impossible or malicious.
-    RejectFuture,
-    /// Tick is too old (age > TICK_INTERVAL_SECS).
-    RejectStale,
-    /// Parent is not a writer (< 2 downstream approvals).
-    /// Child should detach and find a writer parent.
-    RejectNotWriter,
-}
 
 // ── Tests ──
 
 #[cfg(test)]
 mod tests {
+
+    /// GUIDE §5.6a — the demotion must be able to FIRE and to CLEAR.
+    ///
+    /// RULE 3 §4: a gate that has never been shown to fail is a ghost. The
+    /// avoid-list version of this idea shipped earlier the same week and was
+    /// dead on arrival because nothing could ever satisfy its condition, so this
+    /// asserts the state machine in both directions rather than trusting it.
+    #[test]
+    fn address_dispute_demotes_to_read_and_restores() {
+        // Build a genuinely write-qualified node: dc>=2, has upstream, and we
+        // approved the upstream's tick this interval (YPX-003 condition 3).
+        let mut t = TardisNode::new(pk(0xAA));
+        t.add_downstream(pk(0xBB));
+        t.add_downstream(pk(0xCC));
+        t.up = Some(pk(0xDD));
+        t.upstream_status = NodeStatus::Connected;  // has_upstream() requires this
+        t.current_tick = 42;
+        t.last_approved_upstream_tick = 42;
+
+        // Baseline: write-qualified.
+        assert!(t.is_self_writer(), "fixture must start write-qualified, else \
+                                     this test cannot distinguish demotion from \
+                                     a permanently-false predicate");
+        assert!(!t.address_disputed());
+
+        // Peers disagree about our source address ⇒ READ node.
+        t.set_address_disputed(true, 3);
+        assert!(!t.is_self_writer(), "disagreement MUST demote (§5.6a)");
+        assert!(t.address_disputed());
+        assert_eq!(t.address_report_count(), 3);
+        // writer_routing() must inherit it — one predicate, no call-site checks.
+        assert!(!matches!(t.writer_routing(), WriterRouting::IAmWriter),
+                "writer_routing must inherit the demotion, not re-derive it");
+
+        // Observers agree again ⇒ restored, no operator action needed.
+        t.set_address_disputed(false, 4);
+        assert!(t.is_self_writer(), "agreement MUST restore write qualification");
+        assert_eq!(t.address_report_count(), 4);
+    }
+
+    /// RULE 6 (2026-10-01): `/status` must say "Writer" exactly when the door would
+    /// accept a register. MUTATION: `writer_status` uses `downstream_count() == 2`
+    /// (the old proxy) ⇒ RED at "stale upstream tick".
+    #[test]
+    fn status_writer_flag_follows_the_register_door_predicate() {
+        let mut t = TardisNode::new(pk(0xAA));
+        t.add_downstream(pk(0xBB));
+        t.add_downstream(pk(0xCC));
+        t.up = Some(pk(0xDD));
+        t.upstream_status = NodeStatus::Connected;
+        t.current_tick = 42;
+        t.last_approved_upstream_tick = 42;
+        assert_eq!(t.writer_status(), (true, "Writer".to_string()), "write-qualified");
+        assert!(matches!(t.writer_routing(), WriterRouting::IAmWriter));
+        // Two children, but this tick not yet approved upstream: the door redirects.
+        t.current_tick = 43;
+        assert!(!matches!(t.writer_routing(), WriterRouting::IAmWriter), "fixture: door redirects");
+        assert_eq!(t.writer_status(), (false, "D2".to_string()), "stale upstream tick: NOT a writer");
+        // Address disputed: demoted to read even with a fresh tick.
+        t.last_approved_upstream_tick = 43;
+        t.set_address_disputed(true, 2);
+        assert!(!t.writer_status().0, "address disputed: NOT a writer");
+    }
+
     use super::*;
     use crate::crypto::NoopSigner;
     use crate::smt::SparseMerkleTree;
@@ -2126,6 +2969,7 @@ mod tests {
         let mut current_state = [0u8; 32];
         current_state[0] = state;
         NablaEntry {
+            received_from: None,
             wallet_seq: 0,
             wallet_id,
             current_state,
@@ -2428,10 +3272,129 @@ mod tests {
 
     #[test]
     fn audit_no_upstream_skips() {
-        let node = TardisNode::new(pk(0xAA));
+        let mut node = TardisNode::new(pk(0xAA));
         // No upstream → should_audit false
         assert!(!node.should_audit());
         assert!(node.generate_audit_request().is_none());
+    }
+
+
+    // ── G5 / G6: the audit must sample where the auditee cannot predict, and
+    //            only our upstream may answer ────────────────────────────────
+
+    /// G5 — the challenged prefix must NOT be a public function of the tick and
+    /// the requester's pk. It was `blake3(tick ‖ my_pk)[0]`, and the upstream
+    /// holds both: it receives the tick it broadcast, and `my_pk` rides in the
+    /// request as `requester_pk`. So it could pre-compute every downstream's
+    /// next prefix and keep exactly that 1/256 of its database honest.
+    #[test]
+    fn g5_audit_prefix_is_not_derivable_from_public_inputs() {
+        let my_pk = pk(0xAA);
+        let tick = 1740000050u64;
+
+        let mut node = TardisNode::new(my_pk);
+        node.set_upstream(pk(0xBB));
+        node.current_tick = tick;
+        let req = match node.generate_audit_request().unwrap() {
+            TardisAction::SendAuditRequest { request, .. } => request,
+            _ => panic!("expected an audit request"),
+        };
+
+        // What the auditee could compute from what it can see.
+        let public_guess =
+            blake3::hash(&[&tick.to_le_bytes()[..], &my_pk[..]].concat()).as_bytes()[0];
+        assert_ne!(req.prefix[0], public_guess,
+            "G5: the prefix is still the OLD public derivation — the upstream \
+             can pre-compute the sampled slice and tamper everywhere else");
+
+        // Two nodes, identical public inputs, different private seeds → the
+        // prefix must differ. If it did not, the seed is not load-bearing.
+        let mut a = TardisNode::new(my_pk);
+        a.set_upstream(pk(0xBB)); a.current_tick = tick; a.set_audit_seed([0x11; 32]);
+        let mut b = TardisNode::new(my_pk);
+        b.set_upstream(pk(0xBB)); b.current_tick = tick; b.set_audit_seed([0x22; 32]);
+        let pa = match a.generate_audit_request().unwrap() {
+            TardisAction::SendAuditRequest { request, .. } => request.prefix,
+            _ => unreachable!(),
+        };
+        let pb = match b.generate_audit_request().unwrap() {
+            TardisAction::SendAuditRequest { request, .. } => request.prefix,
+            _ => unreachable!(),
+        };
+        assert_ne!(pa, pb,
+            "G5: identical public inputs must still give different prefixes — \
+             the private seed decides the sample");
+    }
+
+    /// G6 — a response from anyone but our upstream must be dropped WITHOUT
+    /// consuming the pending challenge.
+    ///
+    /// `.take()` used to run before the prefix comparison, so ANY response —
+    /// even a junk prefix from an unrelated peer — consumed the challenge and
+    /// the upstream's real answer was then dropped as unsolicited. One peer
+    /// sending one packet per tick disabled another node's upstream auditing
+    /// indefinitely, traced only by a `debug!` line.
+    #[test]
+    fn g6_stranger_cannot_cancel_our_pending_audit() {
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.current_tick = 1740000050;
+
+        let mut smt = SparseMerkleTree::new();
+        smt.put(&make_entry(1, 1, 5));
+        smt.put(&make_entry(2, 2, 6));
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+
+        // A stranger (not our upstream) answers with a junk prefix.
+        let (sh, sib) = smt.subtree_proof(&[0x77], 8);
+        let stranger = SubtreeAuditResponse {
+            prefix: vec![0x77], prefix_bits: 8, subtree_hash: sh,
+            root_hash: smt.root_hash(), response_tick: 10,
+            responder_pk: pk(0xEE), siblings: sib, signature: vec![],
+        };
+        let action = node.verify_audit_response(&stranger, &smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None));
+        assert_eq!(node.audit_responses_unauthorized(), 1,
+            "the refusal must be COUNTED — a denial-of-audit is otherwise \
+             indistinguishable from a quiet network");
+        assert_eq!(node.pending_audit_prefix, Some((vec![0xA3], 10)),
+            "G6: the pending challenge MUST survive a stranger's response");
+
+        // Our upstream's real answer still lands.
+        let (sh2, sib2) = smt.subtree_proof(&[0xA3], 8);
+        let real = SubtreeAuditResponse {
+            prefix: vec![0xA3], prefix_bits: 8, subtree_hash: sh2,
+            root_hash: smt.root_hash(), response_tick: 11,
+            responder_pk: pk(0xBB), siblings: sib2, signature: vec![],
+        };
+        node.verify_audit_response(&real, &smt, &NoopSigner).unwrap();
+        assert_eq!(node.audit_pass_count(), 1,
+            "G6: the upstream's genuine answer must still be evaluated");
+        assert_eq!(node.pending_audit_prefix, None, "matched — challenge consumed");
+    }
+
+    /// A wrong-prefix response from the REAL upstream must also not consume the
+    /// challenge — a late or crossed answer is honest noise, and eating the
+    /// challenge on it re-opens the same denial window.
+    #[test]
+    fn g6_upstream_wrong_prefix_does_not_consume_the_challenge() {
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.current_tick = 1740000050;
+        let mut smt = SparseMerkleTree::new();
+        smt.put(&make_entry(1, 1, 5));
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+
+        let (sh, sib) = smt.subtree_proof(&[0x01], 8);
+        let stale = SubtreeAuditResponse {
+            prefix: vec![0x01], prefix_bits: 8, subtree_hash: sh,
+            root_hash: smt.root_hash(), response_tick: 9,
+            responder_pk: pk(0xBB), siblings: sib, signature: vec![],
+        };
+        node.verify_audit_response(&stale, &smt, &NoopSigner).unwrap();
+        assert_eq!(node.audit_responses_unmatched(), 1, "counted");
+        assert_eq!(node.pending_audit_prefix, Some((vec![0xA3], 10)),
+            "the challenge survives a stale answer from the right peer");
     }
 
     #[test]
@@ -2444,14 +3407,18 @@ mod tests {
         smt.put(&make_entry(1, 1, 5));
         smt.put(&make_entry(2, 2, 6));
 
-        // Upstream responds with matching root
+        // Upstream answers OUR challenge with a REAL proof from its tree
+        // (same tree here — roots match).
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+        let (subtree_hash, siblings) = smt.subtree_proof(&[0xA3], 8);
         let response = SubtreeAuditResponse {
             prefix: vec![0xA3],
             prefix_bits: 8,
-            subtree_hash: [0; 32], // doesn't matter for root comparison
+            subtree_hash,
             root_hash: smt.root_hash(),
             response_tick: 10,
             responder_pk: pk(0xBB),
+            siblings,
             signature: vec![],
         };
 
@@ -2461,7 +3428,86 @@ mod tests {
     }
 
     #[test]
-    fn audit_fail_different_root() {
+    fn audit_divergent_root_is_tolerated() {
+        // KI#48: a root differing from OURS is honest divergence (AE's job),
+        // not evidence of a lying upstream. Pre-fix this detached the parent,
+        // which is exactly what re-orphaned every freshly attached node.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+
+        let smt = SparseMerkleTree::new();
+
+        // Internally-consistent proof (0-level fold: subtree == root) for a
+        // root that differs from ours.
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3],
+            prefix_bits: 8,
+            subtree_hash: [0xFF; 32],
+            root_hash: [0xFF; 32], // doesn't match empty tree
+            response_tick: 10,
+            responder_pk: pk(0xBB),
+            siblings: vec![],
+            signature: vec![],
+        };
+
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None));
+        // Still attached — divergence must never dismantle topology.
+        assert_eq!(node.upstream(), Some(&pk(0xBB)));
+        assert_eq!(node.upstream_status(), NodeStatus::Connected);
+        // No pass credit for a divergent answer.
+        assert_eq!(node.audit_pass_count(), 0);
+    }
+
+    #[test]
+    fn unauthenticated_advertisement_is_not_audit_evidence() {
+        // A TickHash `node_pk` is a CLAIM. Before it was signed, any peer could
+        // emit one naming somebody else's upstream with a bogus root; the §5.5
+        // self-contradiction rule would then detach a healthy parent and cascade
+        // an alert that detached its whole subtree — targeted topology grief
+        // from one forged packet.
+        //
+        // The node layer now verifies the signature against the advertiser's
+        // NBC-anchored key and records ONLY on success. This pins the contract
+        // that the audit consumes: an advertisement that was never recorded
+        // cannot convict anyone, so an unrecorded (forged/unverifiable) TickHash
+        // leaves the upstream attached.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+
+        let smt = SparseMerkleTree::new();
+
+        // NOTHING recorded for tick 10 — the forged advertisement was rejected
+        // at the node layer and never reached branch_root_hashes.
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3],
+            prefix_bits: 8,
+            subtree_hash: [0xFF; 32],
+            root_hash: [0xFF; 32],
+            response_tick: 10,
+            responder_pk: pk(0xBB),
+            siblings: vec![],
+            signature: vec![],
+        };
+
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+        assert!(
+            !matches!(action, TardisAction::CascadeAlert { .. }),
+            "an unauthenticated advertisement must never produce an accusation"
+        );
+        assert_eq!(node.upstream(), Some(&pk(0xBB)), "must stay attached");
+    }
+
+    #[test]
+    fn audit_fail_self_contradiction() {
+        // §5.5: the flaggable lie is the upstream contradicting its OWN
+        // TickHash advertisement for the same tick.
         let mut node = TardisNode::new(pk(0xAA));
         node.set_upstream(pk(0xBB));
         node.add_downstream(pk(0xCC)); // need downstream for cascade
@@ -2469,14 +3515,20 @@ mod tests {
 
         let smt = SparseMerkleTree::new();
 
-        // Upstream responds with DIFFERENT root → questionable
+        // Upstream advertised root [0xEE; 32] at tick 10 via TickHash gossip…
+        node.record_branch_root_hash(10, pk(0xBB), [0xEE; 32], vec![]);
+
+        // …but answers the audit for tick 10 with a (self-consistent) proof
+        // for a DIFFERENT root.
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
         let response = SubtreeAuditResponse {
             prefix: vec![0xA3],
             prefix_bits: 8,
-            subtree_hash: [0; 32],
-            root_hash: [0xFF; 32], // doesn't match empty tree
+            subtree_hash: [0xFF; 32],
+            root_hash: [0xFF; 32],
             response_tick: 10,
             responder_pk: pk(0xBB),
+            siblings: vec![],
             signature: vec![],
         };
 
@@ -2484,9 +3536,383 @@ mod tests {
         assert!(matches!(action, TardisAction::CascadeAlert { .. }));
         assert_eq!(node.upstream_status(), NodeStatus::Disconnected);
         assert_eq!(node.upstream(), None);
+        // KI#71: the conviction is isolated on /status (RULE 3 §2).
+        assert_eq!(node.audit_counters()[3], ("selfcontra_flags", 1));
+    }
+
+    #[test]
+    fn audit_stale_advertisement_matching_our_root_is_exonerated() {
+        // THE MISSING THIRD CASE. The suite pinned two corners —
+        // audit_divergent_root_is_tolerated (no advertisement, divergent) and
+        // audit_fail_self_contradiction (advertised != answered != ours) — but
+        // NOTHING covered the convergent case, where the answer equals OUR
+        // root. That gap is why the bug survived: 24/24 live flags had
+        // answered == our_root and every one detached a healthy parent.
+        //
+        // Mechanism: `advertised` is captured from TickHash gossip earlier in
+        // the tick; `answered` is read live when the audit arrives. A parent
+        // that writes in between contradicts its own gossip WITHOUT lying.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+
+        // Our SMT is the empty tree, so our root is the empty-tree root.
+        let smt = SparseMerkleTree::new();
+        let our_root = smt.root_hash();
+
+        // Upstream gossiped a STALE root for tick 10 …
+        node.record_branch_root_hash(10, pk(0xBB), [0xEE; 32], vec![]);
+
+        // … then answered the audit with its CURRENT root, which equals ours.
+        // Internally consistent (0-level fold: subtree == root).
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3],
+            prefix_bits: 8,
+            subtree_hash: our_root,
+            root_hash: our_root,
+            response_tick: 10,
+            responder_pk: pk(0xBB),
+            siblings: vec![],
+            signature: vec![],
+        };
+
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+
+        // MUST NOT detach: the parent is serving exactly what we hold.
+        assert!(
+            !matches!(action, TardisAction::CascadeAlert { .. }),
+            "a parent whose root equals ours must not be accused"
+        );
+        assert_eq!(node.upstream(), Some(&pk(0xBB)), "must stay attached");
+        assert_eq!(node.upstream_status(), NodeStatus::Connected);
+        assert_eq!(node.audit_exonerated(), 1, "the guard must be observable");
+    }
+
+    #[test]
+    fn audit_fail_proof_does_not_reconstruct() {
+        // KI#48 follow-up: a response whose subtree proof does not fold back
+        // to its own claimed root is internally inconsistent — a provable
+        // lie, flagged regardless of advertisements or our own root.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+
+        let mut smt = SparseMerkleTree::new();
+        smt.put(&make_entry(1, 1, 5));
+
+        node.pending_audit_prefix = Some((vec![0xA3], 10));
+        let (subtree_hash, mut siblings) = smt.subtree_proof(&[0xA3], 8);
+        if siblings.is_empty() {
+            siblings.push([0xAB; 32]);
+        } else {
+            siblings[0] = [0xAB; 32]; // tamper one hash on the path
+        }
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3],
+            prefix_bits: 8,
+            subtree_hash,
+            root_hash: smt.root_hash(),
+            response_tick: 10,
+            responder_pk: pk(0xBB),
+            siblings,
+            signature: vec![],
+        };
+
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::CascadeAlert { .. }));
+        assert_eq!(node.upstream(), None);
+    }
+
+    #[test]
+    fn audit_unsolicited_response_dropped() {
+        // A response with no pending challenge (or the wrong prefix) is
+        // network noise: dropped, never flagged, upstream retained.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.current_tick = 1740000050;
+
+        let smt = SparseMerkleTree::new();
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3],
+            prefix_bits: 8,
+            subtree_hash: [0xFF; 32],
+            root_hash: [0xFF; 32],
+            response_tick: 10,
+            responder_pk: pk(0xBB),
+            siblings: vec![],
+            signature: vec![],
+        };
+
+        // No pending challenge at all…
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None));
+        assert_eq!(node.upstream(), Some(&pk(0xBB)));
+
+        // …and a pending challenge for a DIFFERENT prefix.
+        node.pending_audit_prefix = Some((vec![0x11], 10));
+        let action = node.verify_audit_response(&response, &smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None));
+        assert_eq!(node.upstream(), Some(&pk(0xBB)));
+    }
+
+    #[test]
+    fn audit_full_cycle_request_to_verified_response() {
+        // End-to-end over the real machinery: child challenges, parent
+        // answers from its OWN (different) tree via handle_audit_request,
+        // child verifies the proof and tolerates the divergence.
+        let mut child = TardisNode::new(pk(0xAA));
+        child.set_upstream(pk(0xBB));
+        child.current_tick = 1740000050;
+        child.ticks_since_audit = 5;
+
+        let mut parent = TardisNode::new(pk(0xBB));
+        parent.current_tick = 1740000050;
+
+        let mut parent_smt = SparseMerkleTree::new();
+        parent_smt.put(&make_entry(1, 1, 5));
+        parent_smt.put(&make_entry(2, 2, 6));
+        parent_smt.put(&make_entry(3, 3, 7));
+        let child_smt = SparseMerkleTree::new(); // child diverges (empty)
+
+        let Some(TardisAction::SendAuditRequest { request, target }) =
+            child.generate_audit_request()
+        else {
+            panic!("expected SendAuditRequest");
+        };
+        assert_eq!(target, pk(0xBB));
+
+        let TardisAction::SendAuditResponse { response, .. } =
+            parent.handle_audit_request(&request, &parent_smt, &NoopSigner)
+        else {
+            panic!("expected SendAuditResponse");
+        };
+
+        // The parent's proof verifies against its own root…
+        assert!(SparseMerkleTree::verify_subtree_proof(
+            &response.root_hash,
+            &response.prefix,
+            &response.subtree_hash,
+            &response.siblings,
+        ));
+        // …and the divergent child accepts without detaching.
+        let action = child.verify_audit_response(&response, &child_smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None));
+        assert_eq!(child.upstream(), Some(&pk(0xBB)));
+    }
+
+    // ── KI#71: answer at the advertisement instant ──
+
+    /// The honest busy writer (KI#71, YPX-003 §1.3.5). The parent advertises
+    /// its root for tick T, the child challenges, the parent's SMT moves
+    /// (registrations / AE) BEFORE it answers, and the parent's tick-loop
+    /// anti-entropy probe advertises again under the same label T. Before
+    /// option A the answer and the second advertisement were fresh live
+    /// samples, so the parent signed two different roots for T and the child
+    /// convicted it of SELF-CONTRADICTION (detach + cascade).
+    ///
+    /// MUTATION: drop the same-tick cache check in `advertise_root` (sample
+    /// fresh on every call) → the second advertisement / answer for T carries
+    /// the mutated root, the child holds the first → flagged → RED.
+    #[test]
+    fn honest_writer_mutating_between_advert_and_challenge_never_flagged() {
+        const T: u64 = 1_740_000_050;
+        let mut child = TardisNode::new(pk(0xAA));
+        child.set_upstream(pk(0xBB));
+        child.add_downstream(pk(0xCC)); // a flag would cascade
+        child.current_tick = T;
+        child.ticks_since_audit = 5;
+        let child_smt = SparseMerkleTree::new(); // divergent: no exoneration path
+
+        let mut parent = TardisNode::new(pk(0xBB));
+        parent.add_downstream(pk(0xAA));
+        parent.current_tick = T;
+        let mut parent_smt = SparseMerkleTree::new();
+        parent_smt.put(&make_entry(1, 1, 5));
+
+        // Tick T: the parent advertises (process_tick step 9); the child records it.
+        let (adv_t, answered) = parent.advertise_root(&parent_smt, &NoopSigner);
+        assert!(answered.is_empty());
+        child.record_branch_root_hash(adv_t.tick, pk(0xBB), adv_t.root_hash, adv_t.signature.clone());
+
+        // The child challenges; the parent queues it.
+        let Some(TardisAction::SendAuditRequest { request, .. }) = child.generate_audit_request() else {
+            panic!("expected SendAuditRequest");
+        };
+        assert!(parent.queue_audit_request(&request));
+
+        // The parent is a busy writer: its SMT moves inside tick T.
+        parent_smt.put(&make_entry(2, 2, 6));
+        parent_smt.put(&make_entry(3, 3, 7));
+
+        // Still tick T: the tick loop's AE probe advertises again — it MUST be
+        // the cached (T, root) and must answer nothing yet.
+        let (adv_t_again, answered) = parent.advertise_root(&parent_smt, &NoopSigner);
+        assert_eq!(adv_t_again, adv_t, "one advertisement per tick label (RULE 1)");
+        child.record_branch_root_hash(adv_t_again.tick, pk(0xBB), adv_t_again.root_hash, adv_t_again.signature.clone());
+        assert!(answered.is_empty(), "a request queued after the sample waits for the next one");
+
+        // Tick T+1: fresh sample; the queued request is answered from it.
+        parent.current_tick = T + TICK_INTERVAL_SECS;
+        child.current_tick = T + TICK_INTERVAL_SECS;
+        let (adv_t1, answered) = parent.advertise_root(&parent_smt, &NoopSigner);
+        child.record_branch_root_hash(adv_t1.tick, pk(0xBB), adv_t1.root_hash, adv_t1.signature.clone());
+        assert_eq!(answered.len(), 1);
+        let TardisAction::SendAuditResponse { response, target } = &answered[0] else {
+            panic!("expected SendAuditResponse");
+        };
+        assert_eq!(*target, pk(0xAA));
+        assert_eq!((response.response_tick, response.root_hash), (adv_t1.tick, adv_t1.root_hash),
+            "the answer IS the advertisement: same tick, same root");
+
+        let action = child.verify_audit_response(response, &child_smt, &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::None), "honest writer must not be flagged");
+        assert_eq!(child.upstream(), Some(&pk(0xBB)));
+        assert_eq!(child.audit_counters()[3], ("selfcontra_flags", 0));
+        assert_eq!(child.orphan_causes().via_flag_questionable, 0);
+    }
+
+    /// KI#71 (Fable): the answer now arrives up to ~1 tick after the challenge.
+    /// A re-issue on the next tick must NOT overwrite the pending prefix, or the
+    /// delayed honest answer is `unmatched` and the audit evaluates nothing.
+    ///
+    /// MUTATION: delete the `AUDIT_CHALLENGE_PENDING_TICKS` guard in
+    /// `generate_audit_request` → tick T+1 re-issues a NEW prefix, the T answer
+    /// is unmatched → RED.
+    #[test]
+    fn delayed_answer_still_matches_pending_challenge() {
+        const T: u64 = 1_740_000_050;
+        let mut child = TardisNode::new(pk(0xAA));
+        child.set_upstream(pk(0xBB));
+        child.set_audit_seed([7; 32]);
+        child.current_tick = T;
+        child.ticks_since_audit = 5;
+        let Some(TardisAction::SendAuditRequest { request, .. }) = child.generate_audit_request() else {
+            panic!("expected SendAuditRequest");
+        };
+
+        // One tick later, the cadence still says "audit" (no answer yet).
+        child.current_tick = T + TICK_INTERVAL_SECS;
+        child.ticks_since_audit += 1;
+        assert!(child.should_audit());
+        assert!(child.generate_audit_request().is_none(),
+            "a challenge younger than AUDIT_CHALLENGE_PENDING_TICKS is still owed an answer");
+
+        // The delayed answer (built at the parent's next advertisement) matches.
+        let mut parent_smt = SparseMerkleTree::new();
+        parent_smt.put(&make_entry(1, 1, 5));
+        let mut parent = TardisNode::new(pk(0xBB));
+        parent.add_downstream(pk(0xAA));
+        parent.current_tick = T + TICK_INTERVAL_SECS;
+        assert!(parent.queue_audit_request(&request));
+        let (_, answered) = parent.advertise_root(&parent_smt, &NoopSigner);
+        let TardisAction::SendAuditResponse { response, .. } = &answered[0] else { panic!() };
+        child.verify_audit_response(response, &SparseMerkleTree::new(), &NoopSigner).unwrap();
+        assert_eq!(child.audit_responses_unmatched(), 0, "the delayed answer must match");
+        assert_eq!(child.pending_audit_prefix, None, "matched — challenge consumed");
+
+        // And once the window has passed, a fresh challenge IS issued.
+        child.pending_audit_prefix = Some((vec![0x01], T));
+        child.current_tick = T + axiom_core_logic::types::ticks_to_secs(AUDIT_CHALLENGE_PENDING_TICKS);
+        assert!(child.generate_audit_request().is_some(), "an expired challenge is re-issued");
+    }
+
+    /// KI#71 (Fable): an answer for a tick OLDER than the challenge is counted
+    /// and STILL evaluated — a stale label must not be an escape hatch for an
+    /// equivocator.
+    ///
+    /// MUTATION: return early (drop) when `response_tick < challenge_tick` →
+    /// no CascadeAlert → RED.
+    #[test]
+    fn stale_response_tick_is_counted_and_still_evaluated() {
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+        node.record_branch_root_hash(10, pk(0xBB), [0xEE; 32], vec![]);
+        node.pending_audit_prefix = Some((vec![0xA3], 15)); // challenged at 15
+        let response = SubtreeAuditResponse {
+            prefix: vec![0xA3], prefix_bits: 8,
+            subtree_hash: [0xFF; 32], root_hash: [0xFF; 32],
+            response_tick: 10, // answers with an OLDER label
+            responder_pk: pk(0xBB), siblings: vec![], signature: vec![],
+        };
+        let action = node.verify_audit_response(&response, &SparseMerkleTree::new(), &NoopSigner).unwrap();
+        assert!(matches!(action, TardisAction::CascadeAlert { .. }),
+            "the contradiction at the stale label is still convicted");
+        assert_eq!(node.audit_counters()[2], ("response_stale", 1));
+    }
+
+    /// KI#71 — the audit inbox is bounded WITHOUT a new denial-of-audit: a
+    /// flood of junk requests is shed (and counted), but a downstream child's
+    /// 8-bit challenge is always kept and answered.
+    #[test]
+    fn audit_inbox_never_sheds_a_downstream_challenge() {
+        let mut parent = TardisNode::new(pk(0xBB));
+        parent.add_downstream(pk(0xAA));
+        parent.current_tick = 1740000050;
+        for i in 0..(AUDIT_INBOX_OTHER_CAP as u32 + 10) {
+            let junk = SubtreeAuditRequest {
+                prefix: i.to_le_bytes().to_vec(), prefix_bits: 32,
+                request_tick: 0, requester_pk: pk(0xEE),
+            };
+            parent.queue_audit_request(&junk);
+        }
+        assert_eq!(parent.audit_counters()[4], ("requests_shed", 10));
+        // Even a spoofed flood under the CHILD's own pk cannot crowd it out:
+        // the 8-bit shape is deduped, so all 256 prefixes fit.
+        for b in 0..=255u8 {
+            let req = SubtreeAuditRequest { prefix: vec![b], prefix_bits: 8, request_tick: 0, requester_pk: pk(0xAA) };
+            assert!(parent.queue_audit_request(&req));
+        }
+        let (_, answered) = parent.advertise_root(&SparseMerkleTree::new(), &NoopSigner);
+        assert_eq!(answered.len(), AUDIT_INBOX_OTHER_CAP + 256);
     }
 
     // ── Questionable Cascade ──
+
+    #[test]
+    fn proven_alert_still_detaches() {
+        // The guard must not degrade into "never detach". An alert carrying
+        // evidence — which the node layer only leaves present after verifying
+        // it against the SUSPECT's NBC-anchored key — must still dismantle the
+        // link, because at that point the suspect's own signatures prove the
+        // claim.
+        let mut node = TardisNode::new(pk(0xAA));
+        node.set_upstream(pk(0xBB));
+        node.add_downstream(pk(0xCC));
+        node.current_tick = 1740000050;
+
+        let alert = QuestionableAlert {
+            suspect_pk: pk(0xBB),
+            reporter_pk: pk(0xEE),
+            tick: 1740000048,
+            evidence_hash: [11; 32],
+            signature: vec![],
+            evidence: Some(QuestionableEvidence {
+                audit_response: SubtreeAuditResponse {
+                    prefix: vec![0xA3],
+                    prefix_bits: 8,
+                    subtree_hash: [0xFF; 32],
+                    root_hash: [0xFF; 32],
+                    response_tick: 10,
+                    responder_pk: pk(0xBB),
+                    siblings: vec![],
+                    signature: vec![],
+                },
+                advertised_root: Some([0xEE; 32]),
+                advertised_sig: vec![1, 2, 3],
+            }),
+        };
+
+        let action = node.handle_questionable_alert(&alert, &NoopSigner);
+        assert!(matches!(action, TardisAction::CascadeAlert { .. }));
+        assert_eq!(node.upstream(), None, "a PROVEN accusation must detach");
+        assert_eq!(node.upstream_status(), NodeStatus::Disconnected);
+        assert_eq!(node.alerts_unproven_ignored(), 0, "this one was proven");
+    }
 
     #[test]
     fn questionable_cascades_to_downstream() {
@@ -2502,7 +3928,8 @@ mod tests {
             tick: 1740000048, // fresh (within ALERT_MAX_AGE_SECS of current)
             evidence_hash: [0; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         let action = node.handle_questionable_alert(&alert, &NoopSigner);
         match action {
@@ -2514,9 +3941,16 @@ mod tests {
             _ => panic!("Expected CascadeAlert"),
         }
 
-        // Upstream should be disconnected
-        assert_eq!(node.upstream_status(), NodeStatus::Disconnected);
-        assert_eq!(node.upstream(), None);
+        // CONTRACT CHANGE (2026-08-07): an alert naming our upstream that
+        // carries NO VERIFIED PROOF must still CASCADE (the warning is worth
+        // propagating to nodes that can audit the suspect themselves) but MUST
+        // NOT dismantle topology. Previously this detached on the reporter's
+        // word alone, so one accusation — itself derivable from an unsigned
+        // TickHash — tore down the suspect's whole subtree.
+        assert_eq!(node.upstream_status(), NodeStatus::Connected,
+            "an unproven accusation must not disconnect us");
+        assert_eq!(node.upstream(), Some(&pk(0xBB)), "must stay attached");
+        assert_eq!(node.alerts_unproven_ignored(), 1, "and it must be counted");
     }
 
     #[test]
@@ -2533,7 +3967,8 @@ mod tests {
             tick: 1740000048, // fresh (within ALERT_MAX_AGE_SECS of current)
             evidence_hash: [0; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         let action = node.handle_questionable_alert(&alert, &NoopSigner);
         // Should cascade but NOT disconnect our upstream
@@ -2556,7 +3991,8 @@ mod tests {
             tick: 1740000048,
             evidence_hash: [7; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         // First delivery cascades…
         assert!(matches!(
@@ -2588,7 +4024,8 @@ mod tests {
             tick: 1740000048,
             evidence_hash: [8; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         assert!(matches!(
             node.handle_questionable_alert(&alert, &NoopSigner),
@@ -2647,7 +4084,8 @@ mod tests {
             tick: 1740000050 - ALERT_MAX_AGE_SECS - 1,
             evidence_hash: [9; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         assert!(matches!(
             node.handle_questionable_alert(&alert, &NoopSigner),
@@ -2672,7 +4110,8 @@ mod tests {
             tick: 1740000048,
             evidence_hash: [10; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
 
         // Only forward slot is self → filtered → no cascade at all.
         assert!(matches!(
@@ -2695,15 +4134,23 @@ mod tests {
             tick: 1740000048,
             evidence_hash: [11; 32],
             signature: vec![],
-        };
+                evidence: None,
+            };
         let minted = match node.handle_questionable_alert(&incoming, &NoopSigner) {
             TardisAction::CascadeAlert { alert, .. } => alert,
             other => panic!("Expected CascadeAlert, got {:?}", other),
         };
-        assert_eq!(minted.reporter_pk, pk(0xAA)); // it IS our own mint
+        // CONTRACT CHANGE (2026-08-07): we no longer RE-MINT an accusation we
+        // have not verified. With no proof attached we forward the ORIGINAL
+        // alert unchanged, so the reporter stays the node that actually made
+        // the claim (0xEE) rather than us laundering it under our own identity.
+        // Re-minting an unverified claim is how one accusation acquired N
+        // independent-looking reporters as it cascaded.
+        assert_eq!(minted.reporter_pk, pk(0xEE), "unproven claims are forwarded, not re-minted");
 
-        // The minted alert looping back through a tree cycle must be
-        // dropped — it was recorded as seen at mint time.
+        // KI#37 (unchanged, and the point of this test): the alert looping back
+        // through a tree cycle must still be dropped by the seen-dedup, so one
+        // minted alert produces at most one delivery per node mesh-wide.
         assert!(matches!(
             node.handle_questionable_alert(&minted, &NoopSigner),
             TardisAction::None
@@ -2730,6 +4177,7 @@ mod tests {
                 tick: 1740000048,
                 evidence_hash: evidence,
                 signature: vec![],
+                evidence: None,
             };
             match node.handle_questionable_alert(&alert, &NoopSigner) {
                 TardisAction::CascadeAlert { .. } => cascaded += 1,
@@ -2750,7 +4198,8 @@ mod tests {
             tick: 1740000048,
             evidence_hash: evidence,
             signature: vec![],
-        };
+                evidence: None,
+            };
         assert!(matches!(
             node.handle_questionable_alert(&other, &NoopSigner),
             TardisAction::CascadeAlert { .. }
@@ -2772,6 +4221,7 @@ mod tests {
                 tick: 1740000048,
                 evidence_hash: evidence,
                 signature: vec![],
+                evidence: None,
             };
             node.handle_questionable_alert(&alert, &NoopSigner);
         }
@@ -2850,6 +4300,51 @@ mod tests {
         node.audit_pass_count += 1;
         node.ticks_since_audit = 0;
         assert!(!node.should_audit());
+    }
+
+    // ── Orphan-cause counters ──
+
+    #[test]
+    fn every_clear_path_is_counted() {
+        // The funnel's value is that no path can orphan a node uncounted.
+        let mut n = TardisNode::new(pk(0xAA));
+        n.set_upstream(pk(0x01));
+        n.detach_upstream();
+        assert_eq!(n.orphan_causes().via_detach_upstream, 1);
+
+        n.set_upstream(pk(0x02));
+        n.remove_peer(&pk(0x02));
+        assert_eq!(n.orphan_causes().via_remove_peer, 1);
+
+        // total_cleared is the sum of the via_* buckets, so a new path that
+        // forgets its bucket shows up as a gap between this and reality.
+        assert_eq!(n.orphan_causes().total_cleared(), 2);
+    }
+
+    #[test]
+    fn clearing_when_already_orphaned_counts_nothing() {
+        // No upstream to lose => not an orphan event. Otherwise repeated
+        // remove_peer calls would inflate the counters and make the mesh look
+        // far churnier than it is.
+        let mut n = TardisNode::new(pk(0xAA));
+        n.detach_upstream();
+        n.remove_peer(&pk(0x01));
+        assert_eq!(n.orphan_causes().total_cleared(), 0);
+    }
+
+    #[test]
+    fn silent_parent_detach_is_counted_by_reason() {
+        // The reason must be counted where it is EMITTED: the node handler
+        // calls remove_peer(), so counting at the clear site would file every
+        // detach under via_remove_peer and lose the protocol reason entirely.
+        let mut n = TardisNode::new(pk(0xAA));
+        n.set_upstream(pk(0x01));
+        let mut fired = 0;
+        for _ in 0..(SILENT_PARENT_THRESHOLD as usize + 2) {
+            if n.check_silent_parent().is_some() { fired += 1; }
+        }
+        assert!(fired >= 1, "silent-parent detach never fired");
+        assert_eq!(n.orphan_causes().detach_silent_parent, fired);
     }
 
     // ── Recovery ──
@@ -2970,63 +4465,23 @@ mod tests {
         assert!(TardisNode::is_writer(3));
     }
 
-    // ── Full Tick Validation (time + writer) ──
-
-    #[test]
-    fn full_validation_accept_writer_parent() {
-        let node = TardisNode::new(pk(0xAA));
-        // Time ok, parent has 2 approvals
-        assert_eq!(
-            node.validate_parent_tick_full(100, 103, 2),
-            TickValidation::Accept
-        );
-    }
-
-    #[test]
-    fn full_validation_reject_non_writer_parent() {
-        let node = TardisNode::new(pk(0xAA));
-        // Time ok, but parent has only 1 approval → not a writer
-        assert_eq!(
-            node.validate_parent_tick_full(100, 103, 1),
-            TickValidation::RejectNotWriter
-        );
-    }
-
-    #[test]
-    fn full_validation_reject_zero_approvals() {
-        let node = TardisNode::new(pk(0xAA));
-        // Parent has 0 approvals → definitely not a writer
-        assert_eq!(
-            node.validate_parent_tick_full(100, 103, 0),
-            TickValidation::RejectNotWriter
-        );
-    }
-
-    #[test]
-    fn full_validation_no_seed_exemption() {
-        let node = TardisNode::new(pk(0xAA));
-        // No exemptions — 0 approvals = not a writer, period.
-        // A seed is the same as every other Nabla.
-        assert_eq!(
-            node.validate_parent_tick_full(100, 103, 0),
-            TickValidation::RejectNotWriter
-        );
-    }
-
-    #[test]
-    fn full_validation_time_reject_overrides_writer() {
-        let node = TardisNode::new(pk(0xAA));
-        // Future tick — rejected before writer check
-        assert_eq!(
-            node.validate_parent_tick_full(110, 100, 2),
-            TickValidation::RejectFuture
-        );
-        // Stale tick — rejected before writer check
-        assert_eq!(
-            node.validate_parent_tick_full(100, 106, 2),
-            TickValidation::RejectStale
-        );
-    }
+    // ── Full Tick Validation (time + writer) — REMOVED 2026-08-01 ──
+    //
+    // `validate_parent_tick_full` and its `TickValidation` enum were deleted.
+    // They were TEST-ONLY (no production caller ever existed) and encoded the
+    // RETIRED pre-2026-05-28 tick bounds: a wall-clock past-side staleness check
+    // and NO +5 s forward tolerance. YPX-003 §"Why there is no wall-clock
+    // 'stale' check on the past side" records that design as WRONG — it caused
+    // spurious rejections when `now_secs` lagged `tick.number`.
+    //
+    // Sitting beside the real implementation it read like a reference and
+    // actively misled a reader into reporting the live code as broken. The live
+    // bounds are in `process_tick`: reject when
+    // `tick.number > now_secs + TICK_INTERVAL_SECS` (forward, wall clock, +side
+    // only) and when `tick.number < self.current_tick` (backward, tick-time).
+    //
+    // The writer half of those tests is not lost: `is_writer` is covered
+    // directly by `writer_qualification` above.
 
     // ── Parentless Timeout ──
 
@@ -3309,136 +4764,148 @@ mod tests {
         assert_eq!(node.open_d_count(), 1); // only D2 counts as open
     }
 
-    // ── Recursive Taint Propagation (§32.3) ──
+    // (§32.3 taint-propagation / resolve_merge tests deleted with the code —
+    // ForkSettlement §9r-E4.)
 
-    /// Helper: create a NablaEntry with explicit tx_hash for taint chain testing.
-    fn make_chain_entry(id: u8, state: u8, tx_hash_byte: u8, tick: u64) -> NablaEntry {
-        let mut wallet_id = [0u8; 32];
-        wallet_id[0] = id;
-        let mut current_state = [0u8; 32];
-        current_state[0] = state;
-        let mut tx_hash = [0u8; 32];
-        tx_hash[0] = tx_hash_byte;
-        NablaEntry {
-            wallet_seq: 0,
-            wallet_id,
-            current_state,
-            tx_hash,
-            tick,
-            group_members: None,
-            status: WalletStatus::Normal,
-            client_pk: [0u8; 32],
-            client_sig: vec![0u8; 64],
+    // ── YPX-003 §2.1 P slot (KI#48, RULED 2026-09-25) ───────────────────
+
+    /// A PARKED node has a tick source but is NOT seated: `needs_parent()`
+    /// stays TRUE (it keeps seeking a D slot — the one rule the 08-01 grant
+    /// lacked), `has_upstream()` is false, `is_parked()` is the ONE predicate.
+    ///
+    /// MUTATION: make `needs_parent()` return false while `Pending` (e.g.
+    /// `!self.has_tick_source()`) → THIS test goes red, and so does the
+    /// cold-start sim gate (`nabla-sim --gate cold-start`): every node parks
+    /// and stops seeking, no D attaches, no writers.
+    #[test]
+    fn p_slot_parked_node_needs_parent_and_is_not_seated() {
+        let mut node = TardisNode::new(pk(0x10));
+        assert!(!node.is_parked() && !node.has_tick_source());
+        node.set_upstream_pending(pk(0xA0));
+        assert_eq!(node.upstream(), Some(&pk(0xA0)), "the host is the tick source");
+        assert_eq!(node.upstream_status(), NodeStatus::Pending);
+        assert!(node.is_parked(), "ONE predicate: upstream_status == Pending");
+        assert!(node.has_tick_source(), "parked ⇒ ticks are expected from the host");
+        assert!(!node.has_upstream(), "parked is NOT seated");
+        assert!(node.needs_parent(),
+            "§2.1 step 2: a P node keeps seeking a D slot — needs_parent stays TRUE while parked");
+    }
+
+    /// Evidence (c) as a unit stand-in: a parked node RECEIVES AND VALIDATES
+    /// its host's ticks exactly like a D child (`process_tick` checks only
+    /// `up`), so its tick advances while parked; a tick from anyone else is
+    /// ignored exactly as for a D child.
+    #[test]
+    fn p_slot_parked_node_receives_and_validates_host_ticks() {
+        let mut node = TardisNode::new(pk(0x10));
+        node.set_upstream_pending(pk(0xA0));
+        let smt = SparseMerkleTree::new();
+        let t0 = 1_740_000_000u64;
+        for k in 0..3u64 {
+            let t = t0 + k * TICK_INTERVAL_SECS;
+            let tick = make_tick(t, pk(0xA0), t * 1000);
+            node.process_tick(&tick, &smt, t * 1000, &NoopSigner)
+                .unwrap_or_else(|e| panic!("host tick {} must be accepted while parked: {e:?}", k));
+            assert_eq!(node.current_tick(), t, "tick advanced while parked");
+            assert!(node.is_parked(), "receiving ticks does not seat the node");
         }
+        // Not our host → ignored (TardisAction::None), tick unchanged.
+        let stranger = make_tick(t0 + 10 * TICK_INTERVAL_SECS, pk(0xB0), (t0 + 10 * TICK_INTERVAL_SECS) * 1000);
+        let acts = node.process_tick(&stranger, &smt, (t0 + 10 * TICK_INTERVAL_SECS) * 1000, &NoopSigner).unwrap();
+        assert!(matches!(acts.as_slice(), [TardisAction::None]), "a non-host tick is ignored: {acts:?}");
+        assert_eq!(node.current_tick(), t0 + 2 * TICK_INTERVAL_SECS);
     }
 
+    /// (ii) P is NEVER a writer input, on either side of the link:
+    ///   host — a P child is not in `downstream_count()` (d1/d2 only), so a
+    ///          host with one D child and one P child is dc=1, not a writer;
+    ///   child — a parked node fails `is_self_writer` condition 2 even with
+    ///           two children and a fresh approval.
+    /// MUTATION: count `pending` in `downstream_count()` → THIS test goes red.
     #[test]
-    fn test_recursive_taint_propagation() {
-        // Chain: A → B → C → D
-        // A.current_state = 0x0A
-        // B.tx_hash = 0x0A (references A's state), B.current_state = 0x0B
-        // C.tx_hash = 0x0B (references B's state), C.current_state = 0x0C
-        // D.tx_hash = 0x0C (references C's state), D.current_state = 0x0D
-        let a = make_chain_entry(1, 0x0A, 0x00, 100); // A: no tainted input
-        let b = make_chain_entry(2, 0x0B, 0x0A, 101); // B: tx_hash = A's state
-        let c = make_chain_entry(3, 0x0C, 0x0B, 102); // C: tx_hash = B's state
-        let d = make_chain_entry(4, 0x0D, 0x0C, 103); // D: tx_hash = C's state
+    fn p_slot_never_counts_toward_writer() {
+        // Host side.
+        let mut host = TardisNode::new(pk(0xA0));
+        host.set_upstream(pk(0x01));
+        assert!(host.add_downstream(pk(0xD1)));
+        host.set_pending(pk(0xF0));
+        assert_eq!(host.downstream_count(), 1, "P is not a D slot");
+        assert_eq!(host.children().len(), 2, "…but it IS a tick-forward target");
+        let t = 1_740_000_000u64;
+        host.current_tick = t;
+        host.last_approved_upstream_tick = t;
+        assert!(!host.is_self_writer(), "dc=1 + P must not read as a writer");
+        assert!(host.add_downstream(pk(0xD2)));
+        assert_eq!(host.downstream_count(), 2);
+        assert_eq!(host.children().len(), 3);
+        assert!(host.is_self_writer(), "two REAL D children make the writer");
 
-        // Also add an innocent wallet E that references nothing tainted
-        let e = make_chain_entry(5, 0x0E, 0xFF, 104);
-
-        let mut smt = SparseMerkleTree::new();
-        smt.put(&a);
-        smt.put(&b);
-        smt.put(&c);
-        smt.put(&d);
-        smt.put(&e);
-
-        // Mark A as forked
-        let forked = vec![a.wallet_id];
-        let tainted = TardisNode::propagate_taint(&smt, &forked);
-
-        // B, C, D should all be tainted (recursive propagation)
-        assert!(tainted.contains(&b.wallet_id), "B should be tainted (hop 1)");
-        assert!(tainted.contains(&c.wallet_id), "C should be tainted (hop 2)");
-        assert!(tainted.contains(&d.wallet_id), "D should be tainted (hop 3)");
-
-        // A (forked) and E (innocent) should NOT be in the tainted list
-        assert!(!tainted.contains(&a.wallet_id), "A is forked, not tainted");
-        assert!(!tainted.contains(&e.wallet_id), "E is innocent");
-
-        // Exactly 3 wallets tainted
-        assert_eq!(tainted.len(), 3, "expected exactly B, C, D tainted");
+        // Child side: parked with two children + fresh approval → not a writer.
+        let mut parked = TardisNode::new(pk(0x10));
+        parked.set_upstream_pending(pk(0xA0));
+        assert!(parked.add_downstream(pk(0x21)));
+        assert!(parked.add_downstream(pk(0x22)));
+        parked.current_tick = t;
+        parked.last_approved_upstream_tick = t;
+        assert_eq!(parked.downstream_count(), 2);
+        assert!(!parked.is_self_writer(), "a parked node is never a writer (condition 2)");
+        // Seating it (the host promoted us, or a D slot elsewhere) makes it one.
+        parked.set_upstream(pk(0xA0));
+        assert!(!parked.is_parked() && parked.has_upstream());
+        assert!(parked.is_self_writer());
     }
 
+    /// (iii) leaving P: `detach_upstream` from a parked node returns the host
+    /// (the caller sends it `TardisDetach`, whose `remove_peer` clears the
+    /// host's `pending`), and seating elsewhere flips the status in place.
     #[test]
-    fn test_propagate_taint_no_downstream() {
-        // Single forked wallet with no downstream references
-        let a = make_chain_entry(1, 0x0A, 0x00, 100);
-        let b = make_chain_entry(2, 0x0B, 0xFF, 101); // unrelated
+    fn p_slot_leaving_the_host_clears_both_sides() {
+        let mut child = TardisNode::new(pk(0x10));
+        child.set_upstream_pending(pk(0xA0));
+        assert_eq!(child.detach_upstream(), Some(pk(0xA0)));
+        assert!(!child.is_parked() && child.needs_parent() && !child.has_tick_source());
+        assert_eq!(child.upstream_status(), NodeStatus::Disconnected);
 
-        let mut smt = SparseMerkleTree::new();
-        smt.put(&a);
-        smt.put(&b);
-
-        let tainted = TardisNode::propagate_taint(&smt, &[a.wallet_id]);
-        assert!(tainted.is_empty(), "no downstream should be tainted");
+        // Host side: the child's TardisDetach → remove_peer clears `pending`.
+        let mut host = TardisNode::new(pk(0xA0));
+        host.set_pending(pk(0x10));
+        assert_eq!(host.pending(), Some(&pk(0x10)));
+        host.remove_peer(&pk(0x10));
+        assert!(host.pending().is_none(), "P slot free again");
+        // …and the existing promotion still works for a child that stayed.
+        host.set_pending(pk(0x11));
+        assert!(host.promote_pending());
+        assert_eq!(host.d1(), Some(&pk(0x11)));
     }
 
+    /// A parked node relays its host's ticks to its children, so a parked
+    /// subtree is not a zombie: the parentless timeout must not dismantle it.
     #[test]
-    fn test_resolve_merge_forked_banned_tainted_restored() {
-        // Forked wallet → BANNED, tainted wallet → Normal (restored)
-        let mut forked = make_chain_entry(1, 0xAA, 0x00, 100);
-        forked.status = WalletStatus::Frozen;
-        let mut tainted = make_chain_entry(2, 0xBB, 0x00, 50);
-        tainted.status = WalletStatus::Tainted;
-        let normal = make_chain_entry(3, 0xCC, 0x00, 200);
-
-        let mut smt = SparseMerkleTree::new();
-        smt.put(&forked);
-        smt.put(&tainted);
-        smt.put(&normal);
-
-        let banned = TardisNode::resolve_merge(
-            &mut smt,
-            &[forked.wallet_id],
-            &[tainted.wallet_id],
-        );
-
-        // Only forked wallet should be banned
-        assert_eq!(banned.len(), 1);
-        assert_eq!(banned[0], forked.wallet_id);
-        assert_eq!(smt.get(&forked.wallet_id).unwrap().status, WalletStatus::Banned);
-
-        // Tainted wallet should be restored to Normal
-        assert_eq!(smt.get(&tainted.wallet_id).unwrap().status, WalletStatus::Normal);
-
-        // Unrelated wallet untouched
-        assert_eq!(smt.get(&normal.wallet_id).unwrap().status, WalletStatus::Normal);
+    fn p_slot_parked_subtree_is_not_a_zombie() {
+        let mut node = TardisNode::new(pk(0x10));
+        node.set_upstream_pending(pk(0xA0));
+        assert!(node.add_downstream(pk(0x21)));
+        for _ in 0..(PARENTLESS_TIMEOUT_TICKS + 2) {
+            assert!(matches!(node.check_parentless_timeout(), ParentlessAction::Ok));
+        }
+        // A true orphan with children still counts down.
+        node.detach_upstream();
+        assert!(matches!(node.check_parentless_timeout(), ParentlessAction::Searching(1)));
     }
+}
 
-    #[test]
-    fn test_resolve_merge_multiple_tainted_all_restored() {
-        let mut forked = make_chain_entry(1, 0xAA, 0x00, 100);
-        forked.status = WalletStatus::Frozen;
-        let mut t1 = make_chain_entry(2, 0xBB, 0x00, 50);
-        t1.status = WalletStatus::Tainted;
-        let mut t2 = make_chain_entry(3, 0xCC, 0x00, 30);
-        t2.status = WalletStatus::Tainted;
+/// Test-only fixtures. ForkSettlement §9r-E4: production has NO writer of
+/// `Frozen` / `Tainted`; tests that model a RESTORED LEGACY leaf (snapshot from
+/// a pre-E4 build) build one here, with the same `SameHeadStatusChange` put the
+/// deleted writers used, so the fixture is the on-disk shape a node can load.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::smt::SparseMerkleTree;
+    use crate::types::{WalletId, WalletStatus};
 
-        let mut smt = SparseMerkleTree::new();
-        smt.put(&forked);
-        smt.put(&t1);
-        smt.put(&t2);
-
-        let banned = TardisNode::resolve_merge(
-            &mut smt,
-            &[forked.wallet_id],
-            &[t1.wallet_id, t2.wallet_id],
-        );
-
-        assert_eq!(banned.len(), 1);
-        assert_eq!(smt.get(&t1.wallet_id).unwrap().status, WalletStatus::Normal);
-        assert_eq!(smt.get(&t2.wallet_id).unwrap().status, WalletStatus::Normal);
+    pub(crate) fn legacy_status_leaf(smt: &mut SparseMerkleTree, wallet_id: &WalletId, status: WalletStatus) {
+        let mut e = smt.get(wallet_id).expect("fixture: leaf exists").clone();
+        e.status = status;
+        smt.put_with_proof(&e, crate::smt::PutProof::SameHeadStatusChange);
     }
 }

@@ -126,9 +126,61 @@ pub struct NodeToml {
     /// Dashboard HTTP port (default: 6226, avoids collision with P2P port).
     #[serde(default = "default_dashboard_port")]
     pub dashboard_port: u16,
-    /// Bind dashboard to 0.0.0.0 for remote access (default: false = localhost only).
+    /// REMOVED 2026-09-26 — the dashboard is loopback-only and has no
+    /// remote-bind option (YP "Transport — functional endpoints"). Parsed
+    /// ONLY so that a leftover `dashboard_remote = true` makes the node
+    /// refuse to start instead of silently serving locally while the
+    /// operator believes it is reachable. `false` matches the only
+    /// behaviour and is accepted; delete the key either way.
     #[serde(default)]
-    pub dashboard_remote: bool,
+    pub dashboard_remote: Option<bool>,
+    /// The node's ONE operator wallet_id (the owner 2026-09-20: "Nabla binds one
+    /// wallet and that is the operator wallet"). MUST be a REAL account — a dev
+    /// account (`@axiom` / `@axiom.internal`) is REJECTED at NBC issuance
+    /// (`AXIOM_DESIGN_FactClassIsolation.md` preamble point 0), because
+    /// validators and Nabla nodes must be real accounts. Empty = not declared
+    /// (grandfathered). FOLLOW-UP: bind this into the NBC signing preimage at the
+    /// next genesis ceremony for a tamper-proof guarantee (today it is an
+    /// issuance-time check, matching the k=1 Nabla trust model).
+    #[serde(default)]
+    pub operator_wallet: String,
+    /// The port PEERS reach this node on — REQUIRED, and deliberately NOT
+    /// defaulted (GUIDE_Nabla §5.6a-bis).
+    ///
+    /// ⚠ THE IP CAN BE OBSERVED; THE PORT CANNOT, EVER. A TCP connection is
+    /// `(src IP, src port) → (dst IP, dst port)`; the source port is drawn from
+    /// the ephemeral range by the sender's kernel and NAT rewrites it again in
+    /// flight. A listening port is local state and appears nowhere on the wire,
+    /// so an observed port is ALWAYS wrong.
+    ///
+    /// It is also not necessarily `port`: a router may forward external A to a
+    /// node bound on B. Deriving this from the bind would silently advertise B
+    /// and strand the node behind its own NAT.
+    ///
+    /// ⚠ DO NOT GIVE THIS A DEFAULT. A default is exactly how someone
+    /// advertises 6225 while their router forwards 7000 — a misconfiguration
+    /// the protocol cannot detect, because only a real inbound connection
+    /// proves reachability. Refusing to start is the honest failure.
+    /// This is now the SOLE path — `--advertise` was deleted on 2026-08-26,
+    /// along with `resolve_advertised`, the bootstrap-route UDP probe and the
+    /// periodic own-address re-resolve. A node has no way left to state where it
+    /// is; every peer composes its address from the connection.
+    ///
+    /// ⚠ The earlier version of this comment said the consumer was "only HALF
+    /// wired… `--advertise` (73 refs) still exists". That was true when written
+    /// and is now false — but note what it MISSED, because the next person
+    /// extending this will hit the same thing: `Hello` was never the only
+    /// channel. `TardisAttachRequest`, `TopologyHint::SlotAvailable`,
+    /// `TopologyHint::NewNode` and the peer-exchange self-entry all asserted an
+    /// address too, and fixing only `Hello` left every one of them live. All
+    /// five are converted now.
+    ///
+    /// ⚠ Do NOT roll the fleet until every node.toml carries this field — a node
+    /// without it refuses to start. (The seven LOCAL penguins originally had no
+    /// node.toml at all; since the 2026-08-26 §5.6a-bis roll, axiom-env.py
+    /// generates one per penguin at the DATA-DIR ROOT — note deploy-node.sh must
+    /// ship it explicitly, a config/ rsync does NOT carry it.)
+    pub external_port: u16,
 }
 
 fn default_dashboard_port() -> u16 { 6226 }
@@ -151,6 +203,18 @@ impl NodeToml {
         }
         if node.port == 0 {
             return Err("port must be > 0".to_string());
+        }
+        // §5.6a-bis: the operator declares the reachable port or the node does
+        // not start. A missing field is a toml::from_str error (no serde
+        // default, deliberately); this catches the explicit `external_port = 0`.
+        if node.external_port == 0 {
+            return Err(
+                "external_port must be > 0 — it is the port PEERS reach you on. \
+                 If your router forwards external 7000 to this node's 6225, set \
+                 external_port = 7000. It cannot be observed or guessed: TCP \
+                 never carries a listening port, so only you know it."
+                    .to_string(),
+            );
         }
         Ok(node)
     }
@@ -290,29 +354,30 @@ mod tests {
         // Existing node.toml without dashboard fields — must still parse with defaults.
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
-        fs::write(&toml_path, "name = \"my-node\"\nport = 6225\n").unwrap();
+        fs::write(&toml_path, "name = \"my-node\"\nport = 6225\nexternal_port = 6225\n").unwrap();
         let node = NodeToml::load(&toml_path).unwrap();
         assert_eq!(node.name, "my-node");
         assert_eq!(node.port, 6225);
         assert_eq!(node.dashboard_port, 6226);
-        assert!(!node.dashboard_remote);
+        assert_eq!(node.dashboard_remote, None);
     }
 
     #[test]
     fn test_node_toml_dashboard_fields() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
-        fs::write(&toml_path, "name = \"my-node\"\nport = 6225\ndashboard_port = 7000\ndashboard_remote = true\n").unwrap();
+        fs::write(&toml_path, "name = \"my-node\"\nport = 6225\nexternal_port = 6225\ndashboard_port = 7000\ndashboard_remote = true\n").unwrap();
         let node = NodeToml::load(&toml_path).unwrap();
         assert_eq!(node.dashboard_port, 7000);
-        assert!(node.dashboard_remote);
+        // Parsed only so startup can refuse it (see the field doc).
+        assert_eq!(node.dashboard_remote, Some(true));
     }
 
     #[test]
     fn test_node_toml_reject_empty_name() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
-        fs::write(&toml_path, "name = \"\"\nport = 6225\n").unwrap();
+        fs::write(&toml_path, "name = \"\"\nport = 6225\nexternal_port = 6225\n").unwrap();
         let err = NodeToml::load(&toml_path).unwrap_err();
         assert!(err.contains("empty"), "expected 'empty' in error: {}", err);
     }
@@ -322,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
         let long = "x".repeat(65);
-        fs::write(&toml_path, format!("name = \"{}\"\nport = 6225\n", long)).unwrap();
+        fs::write(&toml_path, format!("name = \"{}\"\nport = 6225\nexternal_port = 6225\n", long)).unwrap();
         let err = NodeToml::load(&toml_path).unwrap_err();
         assert!(err.contains("64"), "expected '64' in error: {}", err);
     }
@@ -331,8 +396,43 @@ mod tests {
     fn test_node_toml_reject_zero_port() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
-        fs::write(&toml_path, "name = \"test\"\nport = 0\n").unwrap();
+        fs::write(&toml_path, "name = \"test\"\nport = 0\nexternal_port = 6225\n").unwrap();
         let err = NodeToml::load(&toml_path).unwrap_err();
         assert!(err.contains("port"), "expected 'port' in error: {}", err);
+    }
+
+    /// A node name is operator-chosen, and operators are not all anglophone —
+    /// AXIOM is meant to be permissionless, so a citizen anywhere must be able
+    /// to name their node in their own script. `node_name` is a `String` on
+    /// the wire and in the NBC (UTF-8 by construction) and the limit is BYTES,
+    /// not chars, so a multi-byte name is legal as long as it fits.
+    ///
+    /// The ASCII-only rule in this project governs the PROTOCOL's own name
+    /// (AXIOM, never AXIØM) — it does not constrain what an operator calls
+    /// their node.
+    #[test]
+    fn test_node_toml_accepts_utf8_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("node.toml");
+        fs::write(&toml_path, "name = \"焼き鳥\"\nport = 6225\nexternal_port = 6225\n").unwrap();
+        let node = NodeToml::load(&toml_path).expect("UTF-8 node name must load");
+        assert_eq!(node.name, "焼き鳥");
+        assert_eq!(node.name.len(), 9, "9 BYTES (3 chars) — the cap is bytes");
+        assert!(node.name.len() <= 64);
+    }
+
+    /// The byte-vs-char distinction is load-bearing: 22 three-byte chars are
+    /// 66 bytes and must be REJECTED even though they are only 22 characters.
+    /// Mutation: change the check to count chars and this goes red.
+    #[test]
+    fn test_node_toml_utf8_limit_is_bytes_not_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("node.toml");
+        let name = "鳥".repeat(22);            // 22 chars, 66 bytes
+        assert_eq!(name.chars().count(), 22);
+        assert_eq!(name.len(), 66);
+        fs::write(&toml_path, format!("name = \"{}\"\nport = 6225\nexternal_port = 6225\n", name)).unwrap();
+        let err = NodeToml::load(&toml_path).unwrap_err();
+        assert!(err.contains("64"), "expected the 64-BYTE limit to reject: {}", err);
     }
 }

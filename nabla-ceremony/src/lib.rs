@@ -6,9 +6,9 @@
 //
 // Two modes:
 //   1. Single-node (production): `nabla-ceremony --config node.toml --root-keys /path/to/root-keys/`
-//   2. Batch/dev:                `nabla-ceremony --dev --base-dir DIR --count N`
+//   2. Batch (genesis set):      `nabla-ceremony --batch --base-dir DIR --count N`
 //
-// Directory layout (batch/dev):
+// Directory layout (batch):
 //   {base_dir}/
 //     nabla-root-keys/                                     (generated here)
 //       root_{1,2,3}.{pub,key}
@@ -224,6 +224,8 @@ pub fn generate_node_nbc(
         signatures: vec![],
         max_tx: axiom_nabla::constants::NBC_TX_BUDGET,
         founding_vbc_hash: [0u8; 32],
+        genesis_lineage: [0u8; 32],
+        nabla_registration: None,
     };
 
     // Compute signing payload via Core
@@ -433,7 +435,7 @@ mod tests {
         let node_dir = dir.path().join("node1");
         fs::create_dir_all(&node_dir).unwrap();
         let toml_path = node_dir.join("node.toml");
-        std::fs::write(&toml_path, "name = \"pi-node\"\nport = 6225\n").unwrap();
+        std::fs::write(&toml_path, "name = \"pi-node\"\nport = 6225\nexternal_port = 6225\n").unwrap();
 
         let result = nabla_ceremony_single(&toml_path, &root_keys_dir).unwrap();
         assert_eq!(result.nbc.node_name, "pi-node");
@@ -461,7 +463,7 @@ mod tests {
         let node_dir = dir.path().join("node1");
         fs::create_dir_all(&node_dir).unwrap();
         let toml_path = node_dir.join("node.toml");
-        std::fs::write(&toml_path, "name = \"test\"\nport = 6225\n").unwrap();
+        std::fs::write(&toml_path, "name = \"test\"\nport = 6225\nexternal_port = 6225\n").unwrap();
 
         // First run succeeds
         nabla_ceremony_single(&toml_path, &root_keys_dir).unwrap();
@@ -475,7 +477,7 @@ mod tests {
     fn test_ceremony_single_fails_without_root_keys() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("node.toml");
-        std::fs::write(&toml_path, "name = \"test\"\nport = 6225\n").unwrap();
+        std::fs::write(&toml_path, "name = \"test\"\nport = 6225\nexternal_port = 6225\n").unwrap();
 
         let nonexistent = dir.path().join("no-such-dir");
         let err = nabla_ceremony_single(&toml_path, &nonexistent).unwrap_err();
@@ -490,7 +492,7 @@ mod tests {
         let node_dir = dir.path().join("node1");
         fs::create_dir_all(&node_dir).unwrap();
         let toml_path = node_dir.join("node.toml");
-        std::fs::write(&toml_path, "name = \"roundtrip\"\nport = 7777\n").unwrap();
+        std::fs::write(&toml_path, "name = \"roundtrip\"\nport = 7777\nexternal_port = 7777\n").unwrap();
 
         let original = nabla_ceremony_single(&toml_path, &root_keys_dir).unwrap();
 
@@ -519,14 +521,14 @@ mod tests {
         let node_a_dir = dir.path().join("node_a");
         fs::create_dir_all(&node_a_dir).unwrap();
         let toml_a = node_a_dir.join("node.toml");
-        std::fs::write(&toml_a, "name = \"node-a\"\nport = 6225\n").unwrap();
+        std::fs::write(&toml_a, "name = \"node-a\"\nport = 6225\nexternal_port = 6225\n").unwrap();
         let a = nabla_ceremony_single(&toml_a, &root_keys_dir).unwrap();
 
         // Node B
         let node_b_dir = dir.path().join("node_b");
         fs::create_dir_all(&node_b_dir).unwrap();
         let toml_b = node_b_dir.join("node.toml");
-        std::fs::write(&toml_b, "name = \"node-b\"\nport = 6226\n").unwrap();
+        std::fs::write(&toml_b, "name = \"node-b\"\nport = 6226\nexternal_port = 6226\n").unwrap();
         let b = nabla_ceremony_single(&toml_b, &root_keys_dir).unwrap();
 
         // k=1 invariant: exactly one issuer in each NBC.

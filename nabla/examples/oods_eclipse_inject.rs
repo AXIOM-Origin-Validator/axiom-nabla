@@ -55,7 +55,7 @@ impl Wallet {
     fn new(seed: [u8; 32], email: &str, balance: u64) -> Self {
         let sk = SigningKey::from_bytes(&seed);
         let pk = VerifyingKey::from(&sk);
-        let state_id = compute_genesis_state_id(&pk.to_bytes(), balance);
+        let state_id = compute_genesis_state_id(&pk.to_bytes(), balance, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP);
         let address = generate_wallet_id(email, "42", &pk.to_bytes())
             .unwrap_or_else(|_| format!("{}/0000000042", email));
         Wallet { sk, pk, state_id, balance, address }
@@ -77,7 +77,12 @@ impl Wallet {
     }
     fn ws(&self) -> WalletState {
         WalletState {
-            hibernation_until: 0, public_key: self.pk.to_bytes().to_vec(),
+            hibernation_until: 0,
+            // §5.2.2c — these harnesses drive OODS, not the subsidy claim: no
+            // stake lock held. Field added 2026-09-05.
+            wall_clock_lock: 0, public_key: self.pk.to_bytes().to_vec(),
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             balance: self.balance, wallet_seq: 0, state_id: self.state_id,
             auth_hash: None, wallet_id: None, group_members: None,
         }
@@ -89,7 +94,7 @@ impl Wallet {
             sender_wallet_id: String::new(), wallet_seq: 1,
             receiver_wallet_id: receiver.to_string(), receiver_address: None,
             core_id: [0u8; 32], amount, reference: "vector-test".to_string(),
-            nonce: 12345, epoch: 1, client_sig: vec![], owner_proof: None,
+            nonce: 12345, epoch: 1, client_sig: vec![],
             scar_passcode: None, burn_target_tx_id: None, oracle_claim: None,
             required_k: 0, proof_type: 0, core_version: String::new(), kind: TxKind::Normal,
         };
@@ -100,8 +105,18 @@ impl Wallet {
 
 fn base_inputs(mode: CoreLogicMode, tx: Transaction, state: Option<WalletState>) -> PublicInputs {
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        receiver_witness: None,
+        receiver_signing_key: None,
         recall_attestation: None,
+        fob_claim_attestation: None, // §10.0 FOB fee-claim — not exercised here
         oods_attestation: None, receiver_current_hibernation: None,
+        // §5.2.2b/c — added 2026-09-05; this harness drives OODS, not a claim.
+        receiver_current_wall_clock_lock: None, claimant_vbc: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
         mode, transaction: tx, prev_receipts: vec![], current_state: state,
         vbc_bundle: None, cheque_bundle: None, receiver_pk: None,
         receiver_current_balance: None, receiver_wallet_seq: None,
@@ -112,15 +127,13 @@ fn base_inputs(mode: CoreLogicMode, tx: Transaction, state: Option<WalletState>)
         fact_witness_sigs: vec![], issuer_sphincs_sk: None,
         cl1_execution_proof: None, zkp_nonce: None,
         audit_confirmation: None, nonce_response: None, audit_response: None,
-        scar_heal_tx_id: None, scar_heal_nabla_id: None, scar_heal_root_hash: None,
-        wallet_secret: None, fanout_message: None, candidate_balance: None,
-        nabla_stake_proof: None, frozen_wallets: None,
+        wallet_secret: None, fanout_message: None, nabla_stake_proof: None, frozen_wallets: None,
         console_current_cert: None, console_new_cert: None,
         console_selector_picks: None, console_nominations: None,
         txid_attestation: None, cheque_claim_proof: None, clara_attestation: None,
         phase_out_payload: None, phase_out_era_end_ticks: vec![],
         phase_out_blocked_era_ids: vec![],
-        local_core_id: [0u8; 32], withdrawal_inputs: None,
+        local_core_id: [0u8; 32],
         max_fact_links: None, current_tick: 0,
     }
 }
@@ -145,6 +158,9 @@ fn baselined_attestation(oods_size: u32) -> NablaOodsAttestation {
     // baseline suffix rides ONLY because network_size_baseline != 0 (§7).
     let nbc = VBC {
         version: 0x09,
+        // §5.3 — an NBC issued by a root authority is chain_depth 0; zero is
+        // the genesis/no-lineage sentinel it legitimately carries.
+        genesis_lineage: [0u8; 32],
         validator_id: axiom_core_logic::compute::compute_validator_id(&root_pk),
         subject_pubkey_sphincs: root_pk.clone(),
         subject_pubkey_dilithium: vec![0u8; 1952],
@@ -161,6 +177,7 @@ fn baselined_attestation(oods_size: u32) -> NablaOodsAttestation {
         founding_vbc_hash: [0u8; 32],
         network_size_baseline: BASELINE,
         baseline_tick: BASELINE_TICK,
+        nabla_registration: None,
     };
     let pre_image = axiom_core_logic::compute::compute_vbc_signing_payload_bytes(&nbc);
     let nbc_hash = blake3::hash(&pre_image);
@@ -201,6 +218,7 @@ fn resolved_chain(n: usize) -> FactChain {
     let mut links = Vec::new();
     for i in 0..n {
         links.push(FactLink {
+            burn_target_tx_id: None,
             tx_id: [100 + i as u8; 32],
             previous_state_id: [i as u8; 32],
             new_state_id: [(i + 1) as u8; 32],
@@ -209,13 +227,14 @@ fn resolved_chain(n: usize) -> FactChain {
             required_k: 3,
             witnesses: vec![],
             nabla_confirmation: Some(NablaConfirmation::default()), // resolved
-            receiver_contact: None,
             burn_proof: None,
             sender_anchor: None,
             is_dev_class: false,
             recall_proof: None,
+            out_of_order_confirmation: None,
             inherited_scar_txids: Vec::new(),
             inherited_scar_resolutions: Vec::new(),
+            receiver_witness: None,
         });
     }
     FactChain { checkpoint: None, links }
@@ -266,7 +285,7 @@ fn main() {
 
     // Eclipsed view (healthy=false): no PROPOSE, no links touched.
     let mut eclipsed = resolved_chain(6);
-    axiom_core_logic::compute::advance_fact_checkpoint(&mut eclipsed, vid, &dpk, &dsk, false)
+    axiom_core_logic::compute::advance_fact_checkpoint(&mut eclipsed, vid, &dpk, &dsk, [0u8; 32], false)
         .expect("advance");
     let blocked = eclipsed.checkpoint.is_none() && eclipsed.links.len() == 6;
     println!(
@@ -278,7 +297,7 @@ fn main() {
 
     // Healthy view (control): PROPOSE fires, a checkpoint appears.
     let mut healthy = resolved_chain(6);
-    axiom_core_logic::compute::advance_fact_checkpoint(&mut healthy, vid, &dpk, &dsk, true)
+    axiom_core_logic::compute::advance_fact_checkpoint(&mut healthy, vid, &dpk, &dsk, [0u8; 32], true)
         .expect("advance");
     let proceeded = healthy.checkpoint.is_some();
     println!(

@@ -9,7 +9,7 @@ name = "nabla-ceremony"
 path = "src/bin/nabla_ceremony.rs"
 
 [dependencies]
-axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["ceremony"] }
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = true, features = ["ceremony"] }
 axiom-nabla = { path = "../nabla" }
 fips205 = { version = "0.4", features = ["slh_dsa_sha2_128s"] }
 fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65", "default-rng"] }

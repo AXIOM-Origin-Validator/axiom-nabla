@@ -43,6 +43,19 @@ fn main() {
     let mut max_ticks: Option<u64> = None; // stop after N ticks
     let mut sim_option: u8 = 1;            // --option 1|2|3
     let mut option_explicit = false;       // true if --option was passed on CLI
+    // KI#48 (RULED 2026-09-25) — PASS/FAIL gate mode (binary mode only):
+    //   cold-start  every node boots dc=0; PASS iff writers appear, ticks
+    //               advance, and no node is left orphaned/parked by --ticks.
+    //   recovery    --kill-at/--kill-count run; PASS iff RECOVERY COMPLETE.
+    // Exit contract (tests/check_registry.toml): 0 PASS, 1 FAIL, 2 UNVERIFIED.
+    let mut gate: Option<String> = None;
+    // --fresh: wipe every node's persisted state (keep config/ + node.toml)
+    // before launch, so the run is a true cold start. Implied by --gate.
+    let mut fresh = false;
+    // --seed-from <live base>: copy the ten genesis config/ identities into
+    // --base-dir first (a throwaway sim tree), so a gate never runs over the
+    // fleet's own directories.
+    let mut seed_from: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -102,6 +115,25 @@ fn main() {
                     max_ticks = Some(args[i].parse().unwrap_or(200));
                 }
             }
+            "--fresh" => { fresh = true; }
+            "--seed-from" => {
+                i += 1;
+                if i < args.len() { seed_from = Some(args[i].clone()); }
+            }
+            "--gate" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].as_str() {
+                        "cold-start" | "recovery" => gate = Some(args[i].clone()),
+                        other => {
+                            eprintln!("Unknown gate: {} (expected 'cold-start' or 'recovery')", other);
+                            std::process::exit(2);
+                        }
+                    }
+                    // A gate is non-interactive: option 1 unless told otherwise.
+                    if !option_explicit { option_explicit = true; }
+                }
+            }
             "--option" => {
                 i += 1;
                 if i < args.len() {
@@ -130,6 +162,9 @@ fn main() {
                 println!("  -p, --port <N>        HTTP port (default: {})", DEFAULT_PORT);
                 println!("  -h, --help            Show this help");
                 println!("  --option <1|2|3>      Sim option (binary mode only, default: 1)");
+                println!("  --gate <cold-start|recovery>  Binary-mode PASS/FAIL gate (exit 0/1/2), KI#48");
+                println!("  --fresh               Wipe node data (not config/) before launch; implied by --gate");
+                println!("  --seed-from <DIR>     Copy the 10 genesis config/ identities from DIR into --base-dir first");
                 println!();
                 println!("Modes:");
                 println!("  lib      In-process simulation (default). All nodes run in the same process.");
@@ -197,7 +232,76 @@ fn main() {
 
     match sim_mode {
         SimMode::Lib => run_lib_mode(node_count, speed, port, &base_dir),
-        SimMode::Binary => run_binary_mode(node_count, speed, port, &base_dir, kill_at, kill_count, max_ticks, sim_option),
+        SimMode::Binary => run_binary_mode(node_count, speed, port, &base_dir, kill_at, kill_count, max_ticks, sim_option, gate.as_deref(), fresh || gate.is_some(), seed_from.as_deref()),
+    }
+}
+
+/// KI#48 P-slot evidence + gate bookkeeping for `--gate` runs.
+#[derive(Default)]
+struct GateState {
+    /// First sim tick at which at least one writer (dc=2) was observed.
+    first_writer_tick: Option<u64>,
+    /// First sim tick at which EVERY alive node was seated (no orphan, nothing
+    /// parked) — the same first-attainment reading the RECOVERY COMPLETE gate
+    /// uses. A rotating steady-state mesh wobbles orph 0→1→0 by design
+    /// (§2.15.5, KI#48 postscript), so a single end-of-run snapshot is not
+    /// the property; reaching a fully seated tree is.
+    full_sync_tick: Option<u64>,
+    /// Max `tardis_tick` over alive nodes, one entry per sim tick.
+    max_tardis_tick: Vec<u64>,
+    /// Per node: (first sim tick parked, tardis_tick then, last sim tick parked, tardis_tick then).
+    parked: std::collections::BTreeMap<usize, (u64, u64, u64, u64)>,
+    recovery_complete: bool,
+    /// Orphan count from the stats of the tick being observed (set by the
+    /// caller before `observe`, since the view carries no `needs_parent`).
+    pending_orphans: usize,
+}
+
+impl GateState {
+    fn observe(&mut self, tick: u64, view: &[(usize, bool, u64, usize)]) {
+        let writers = view.iter().filter(|(_, _, _, dc)| *dc == 2).count();
+        if writers > 0 && self.first_writer_tick.is_none() {
+            self.first_writer_tick = Some(tick);
+            println!("[GATE] first writer observed at sim tick {} ({} writer(s))", tick, writers);
+        }
+        self.max_tardis_tick.push(view.iter().map(|(_, _, tt, _)| *tt).max().unwrap_or(0));
+        if self.first_writer_tick.is_some() && self.full_sync_tick.is_none() && !view.is_empty() {
+            // Judged from the sim's own orphan reading (`needs_parent`), which
+            // is TRUE while parked — so this also proves P was transitional.
+            let seated = view.iter().all(|(_, parked, _, _)| !parked);
+            if seated && self.pending_orphans == 0 {
+                self.full_sync_tick = Some(tick);
+                println!("[GATE] every node seated (orph 0, parked 0) at sim tick {}", tick);
+            }
+        }
+        for (idx, parked, tt, dc) in view {
+            if *parked {
+                println!("[P-PARKED T{}] node{} tick={} dc={}", tick, idx, tt, dc);
+                self.parked
+                    .entry(*idx)
+                    .and_modify(|e| { e.2 = tick; e.3 = *tt; })
+                    .or_insert((tick, *tt, tick, *tt));
+            }
+        }
+    }
+
+    /// Ticks are FLOWING if the max tardis tick advanced over the last
+    /// `window` sim ticks (a frozen tree reads identical values).
+    fn ticks_flowing(&self, window: usize) -> bool {
+        let n = self.max_tardis_tick.len();
+        if n <= window { return false; }
+        self.max_tardis_tick[n - 1] > self.max_tardis_tick[n - 1 - window]
+    }
+
+    fn parked_summary(&self) -> String {
+        if self.parked.is_empty() {
+            return "parked_seen=0 (no P grant occurred in this run)".to_string();
+        }
+        let mut parts = Vec::new();
+        for (idx, (t0, tt0, t1, tt1)) in &self.parked {
+            parts.push(format!("node{} parked T{}..T{} tick {}->{} (+{})", idx, t0, t1, tt0, tt1, tt1.saturating_sub(*tt0)));
+        }
+        format!("parked_seen={} [{}]", self.parked.len(), parts.join("; "))
     }
 }
 
@@ -211,6 +315,9 @@ fn run_binary_mode(
     kill_count: usize,
     max_ticks: Option<u64>,
     sim_option: u8,
+    gate: Option<&str>,
+    fresh: bool,
+    seed_from: Option<&str>,
 ) {
     // Find the nabla-node binary
     let binary_path = std::env::current_exe()
@@ -221,7 +328,41 @@ fn run_binary_mode(
     if !binary_path.exists() {
         eprintln!("ERROR: nabla-node binary not found at {:?}", binary_path);
         eprintln!("Build it first: cargo build -p axiom-nabla --bin nabla-node");
-        std::process::exit(1);
+        // A gate cannot be judged without the binary: UNVERIFIED, not FAIL.
+        std::process::exit(if gate.is_some() { 2 } else { 1 });
+    }
+    if let Some(src) = seed_from {
+        match BinarySimNetwork::seed_genesis_configs(std::path::Path::new(src), base_dir, node_count) {
+            Ok(n) => println!("[BIN-SIM] --seed-from: copied {} identity files from {} into {}", n, src, base_dir.display()),
+            Err(e) => {
+                eprintln!("[BIN-SIM] --seed-from failed: {}", e);
+                std::process::exit(if gate.is_some() { 2 } else { 1 });
+            }
+        }
+    }
+    // A gate needs the genesis ceremony NBCs to exist, or nothing can attach.
+    if gate.is_some() {
+        if let Err(e) = axiom_nabla::ceremony::load_nbcs(base_dir, 10.min(node_count)) {
+            eprintln!("[GATE] UNVERIFIED: ceremony NBCs missing under {}: {}", base_dir.display(), e);
+            std::process::exit(2);
+        }
+    }
+    // Bound every gate run: cold-start judges at --ticks (default 80);
+    // recovery must complete within --ticks (default 200).
+    let max_ticks = match gate {
+        Some("cold-start") => Some(max_ticks.unwrap_or(80)),
+        Some("recovery") => Some(max_ticks.unwrap_or(200)),
+        _ => max_ticks,
+    };
+    let mut gate_state = GateState::default();
+    if fresh {
+        match BinarySimNetwork::wipe_node_data(base_dir, node_count) {
+            Ok(n) => println!("[BIN-SIM] --fresh: wiped {} persisted entries under {} (config/ kept)", n, base_dir.display()),
+            Err(e) => {
+                eprintln!("[BIN-SIM] --fresh: wipe failed: {}", e);
+                std::process::exit(if gate.is_some() { 2 } else { 1 });
+            }
+        }
     }
 
     // ── Option 2: Delete non-genesis directories ──
@@ -330,6 +471,10 @@ fn run_binary_mode(
             }
 
             let stats = net.stats();
+            if gate.is_some() {
+                gate_state.pending_orphans = stats.tardis_orphans;
+                gate_state.observe(net.tick, &net.node_tardis_view());
+            }
             (net.tick, delivered, stats)
         };
 
@@ -337,10 +482,10 @@ fn run_binary_mode(
         let verbose = killed && kill_at.is_some_and(|kt| tick >= kt);
         if verbose || tick % 5 == 0 {
             println!(
-                "[T{:>6}] alive={}/{} msgs={} tardis=sync:{:.0}%|write:{:.0}%|orph:{}",
+                "[T{:>6}] alive={}/{} msgs={} tardis=sync:{:.0}%|write:{:.0}%|orph:{}|parked:{}",
                 tick, stats.alive_nodes, stats.total_nodes,
                 delivered, stats.tardis_sync_pct, stats.tardis_writer_pct,
-                stats.tardis_orphans
+                stats.tardis_orphans, stats.tardis_parked
             );
         }
 
@@ -354,17 +499,22 @@ fn run_binary_mode(
             println!("║  Sync: {:.0}%  Write: {:.0}%  Orphans: {}                        ║",
                 stats.tardis_sync_pct, stats.tardis_writer_pct, stats.tardis_orphans);
             println!("╚══════════════════════════════════════════════════════════════╝");
+            gate_state.recovery_complete = true;
             // Keep running for 20 more ticks to show stability
             for _ in 0..20 {
                 std::thread::sleep(tick_interval);
                 let mut net = network.lock().unwrap();
                 let delivered = net.step();
                 let stats = net.stats();
+                if gate.is_some() {
+                    gate_state.pending_orphans = stats.tardis_orphans;
+                    gate_state.observe(net.tick, &net.node_tardis_view());
+                }
                 println!(
-                    "[T{:>6}] alive={}/{} msgs={} tardis=sync:{:.0}%|write:{:.0}%|orph:{}",
+                    "[T{:>6}] alive={}/{} msgs={} tardis=sync:{:.0}%|write:{:.0}%|orph:{}|parked:{}",
                     net.tick, stats.alive_nodes, stats.total_nodes,
                     delivered, stats.tardis_sync_pct, stats.tardis_writer_pct,
-                    stats.tardis_orphans
+                    stats.tardis_orphans, stats.tardis_parked
                 );
             }
             break;
@@ -387,6 +537,44 @@ fn run_binary_mode(
         if elapsed < tick_interval {
             std::thread::sleep(tick_interval - elapsed);
         }
+    }
+
+    // Reap every child on the way out — sim runs used to leak all 10
+    // stdio node processes per run (KI#48 debugging debris).
+    let final_stats = network.lock().unwrap().stats();
+    let spontaneous_exits = network.lock().unwrap().spontaneous_exits;
+    network.lock().unwrap().kill_all();
+
+    // ── KI#48 gate verdict (exit contract 0/1/2) ──
+    if let Some(g) = gate {
+        let flowing = gate_state.ticks_flowing(10);
+        let n = gate_state.max_tardis_tick.len();
+        let tick_delta = if n > 10 {
+            gate_state.max_tardis_tick[n - 1].saturating_sub(gate_state.max_tardis_tick[n - 11])
+        } else { 0 };
+        println!();
+        println!("[GATE {}] first_writer_tick={:?} full_sync_tick={:?} writers_now={:.0}% ticks_flowing={} (max tardis tick +{} over last 10 sim ticks) orph={} parked={} sync={:.0}% recovery_complete={} {}",
+            g, gate_state.first_writer_tick, gate_state.full_sync_tick, final_stats.tardis_writer_pct, flowing, tick_delta,
+            final_stats.tardis_orphans, final_stats.tardis_parked, final_stats.tardis_sync_pct,
+            gate_state.recovery_complete, gate_state.parked_summary());
+        let pass = match g {
+            // The exact 08-01 stall shape was "no writers, ticks frozen, every
+            // node parked". PASS = writers appeared, the tree REACHED fully
+            // seated (orph 0 ⇒ nothing left parked, since needs_parent stays
+            // true while parked — first attainment, as RECOVERY COMPLETE reads
+            // it), writers still exist at the end, and the tick is advancing.
+            "cold-start" => gate_state.first_writer_tick.is_some()
+                && gate_state.full_sync_tick.is_some()
+                && final_stats.tardis_writer_pct > 0.0
+                && flowing,
+            "recovery" => gate_state.recovery_complete,
+            _ => false,
+        };
+        // A child that died on its own is a FAIL whatever the tree read —
+        // its stale status is not evidence of anything.
+        let pass = pass && spontaneous_exits == 0;
+        println!("[GATE {}] spontaneous_exits={} {}", g, spontaneous_exits, if pass { "PASS" } else { "FAIL" });
+        std::process::exit(if pass { 0 } else { 1 });
     }
 }
 
